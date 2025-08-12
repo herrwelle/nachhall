@@ -495,29 +495,52 @@
             const { x, y, width: rectWidth, height: rectHeight } = rect;
 
             const spectData = [];
-            const timeSteps = 100; // 时间分辨率
-            const freqSteps = 50;  // 频率分辨率
+            const timeSteps = 200; // 增加时间分辨率
+            const freqSteps = 513; // 使用与编码器相同的频率分辨率 (NFFT/2 + 1)
+
+            console.log(`提取频谱数据: ${timeSteps}x${freqSteps}`);
 
             for (let t = 0; t < timeSteps; t++) {
-                const frameData = [];
+                const frameData = new Float32Array(freqSteps);
                 const pixelX = Math.floor(x + (t / timeSteps) * rectWidth);
 
                 for (let f = 0; f < freqSteps; f++) {
+                    // Y轴翻转：频谱图底部是低频，顶部是高频
                     const pixelY = Math.floor(y + rectHeight - (f / freqSteps) * rectHeight);
 
-                    if (pixelX < width && pixelY >= 0) {
-                        const brightness = getPixelBrightness(data, pixelX, pixelY, width);
-                        // 转换为幅度（亮度越低，幅度越高）
-                        const amplitude = (255 - brightness) / 255;
-                        frameData.push(amplitude);
+                    if (pixelX < width && pixelY >= 0 && pixelY < imageData.height) {
+                        // 使用3x3平均来减少噪声
+                        let brightnessSum = 0;
+                        let count = 0;
+
+                        for (let dy = -1; dy <= 1; dy++) {
+                            for (let dx = -1; dx <= 1; dx++) {
+                                const sampleX = pixelX + dx;
+                                const sampleY = pixelY + dy;
+
+                                if (sampleX >= 0 && sampleX < width &&
+                                    sampleY >= 0 && sampleY < imageData.height) {
+                                    brightnessSum += getPixelBrightness(data, sampleX, sampleY, width);
+                                    count++;
+                                }
+                            }
+                        }
+
+                        const avgBrightness = brightnessSum / count;
+
+                        // 改进的幅度映射：使用对数缩放
+                        const normalized = (255 - avgBrightness) / 255;
+                        const amplitude = Math.pow(normalized, 0.5); // 平方根增强对比度
+                        frameData[f] = amplitude * 0.8; // 控制整体音量
                     } else {
-                        frameData.push(0);
+                        frameData[f] = 0;
                     }
                 }
 
                 spectData.push(frameData);
             }
 
+            console.log('频谱数据提取完成');
             return spectData;
         }
 
@@ -563,7 +586,7 @@
 
         async function startFingerTracking(x, y) {
             console.log('开始手指跟踪:', x, y);
-            
+
             fingerPosition = { x, y };
             lastFingerTime = performance.now();
 
@@ -590,7 +613,7 @@
             // 更新手指轨迹显示
             fingerTrail.style.left = (x - 10) + 'px';
             fingerTrail.style.top = (y - 10) + 'px';
-            
+
             console.log('手指位置更新:', x, y);
 
             // 计算在频谱图中的位置
@@ -664,14 +687,25 @@
             if (!audioContext || !spectrogramData || isPlaying) return;
 
             try {
-                // 获取当前位置的频谱数据
-                const timeIndex = Math.floor(position * spectrogramData.length);
-                const frameData = spectrogramData[Math.min(timeIndex, spectrogramData.length - 1)];
+                // 使用线性插值获取更平滑的频谱数据
+                const exactIndex = position * (spectrogramData.length - 1);
+                const leftIndex = Math.floor(exactIndex);
+                const rightIndex = Math.min(leftIndex + 1, spectrogramData.length - 1);
+                const fraction = exactIndex - leftIndex;
 
-                if (!frameData) return;
+                const leftFrame = spectrogramData[leftIndex];
+                const rightFrame = spectrogramData[rightIndex];
+
+                if (!leftFrame || !rightFrame) return;
+
+                // 线性插值混合两帧
+                const interpolatedFrame = new Float32Array(leftFrame.length);
+                for (let i = 0; i < leftFrame.length; i++) {
+                    interpolatedFrame[i] = leftFrame[i] * (1 - fraction) + rightFrame[i] * fraction;
+                }
 
                 // 生成音频
-                const audioBuffer = synthesizeAudio(frameData);
+                const audioBuffer = synthesizeAudio(interpolatedFrame);
                 if (audioBuffer) {
                     playAudioBuffer(audioBuffer);
                 }
@@ -682,25 +716,134 @@
         }
 
         function synthesizeAudio(magnitudes) {
-            const bufferLength = 2048; // 短音频片段
+            const fftSize = 1024; // 使用与编码器相同的FFT大小
+            const bufferLength = fftSize;
             const buffer = audioContext.createBuffer(1, bufferLength, SAMPLE_RATE);
             const channelData = buffer.getChannelData(0);
 
-            // 简单的加法合成
+            // 使用IFFT重建音频
+            const complexSpectrum = new Float32Array(fftSize * 2);
+
+            // 构建复数频谱
+            for (let i = 0; i < magnitudes.length && i < fftSize / 2 + 1; i++) {
+                const magnitude = magnitudes[i];
+
+                // 使用随机相位（更自然的声音）
+                const phase = Math.random() * 2 * Math.PI;
+
+                // 实部和虚部
+                complexSpectrum[i * 2] = magnitude * Math.cos(phase);
+                complexSpectrum[i * 2 + 1] = magnitude * Math.sin(phase);
+            }
+
+            // 镜像对称（实信号的要求）
+            for (let i = 1; i < fftSize / 2; i++) {
+                const srcIdx = i * 2;
+                const dstIdx = (fftSize - i) * 2;
+                complexSpectrum[dstIdx] = complexSpectrum[srcIdx];
+                complexSpectrum[dstIdx + 1] = -complexSpectrum[srcIdx + 1];
+            }
+
+            // 执行IFFT
+            const timeSignal = ifft(complexSpectrum, fftSize);
+
+            // 应用窗函数和归一化
+            const window = hanningWindow(fftSize);
+            let maxVal = 1e-10;
+
             for (let i = 0; i < bufferLength; i++) {
-                let sample = 0;
+                timeSignal[i] *= window[i];
+                maxVal = Math.max(maxVal, Math.abs(timeSignal[i]));
+            }
 
-                for (let f = 0; f < magnitudes.length; f++) {
-                    const frequency = (f / magnitudes.length) * (SAMPLE_RATE / 2);
-                    const amplitude = magnitudes[f] * 0.1; // 降低音量
-                    const phase = (i / SAMPLE_RATE) * frequency * 2 * Math.PI;
-                    sample += amplitude * Math.sin(phase);
-                }
-
-                channelData[i] = Math.tanh(sample); // 软限幅
+            // 归一化并复制到音频缓冲区
+            const gain = 0.3 / maxVal; // 控制音量
+            for (let i = 0; i < bufferLength; i++) {
+                channelData[i] = Math.tanh(timeSignal[i] * gain);
             }
 
             return buffer;
+        }
+
+        // Hanning窗函数
+        function hanningWindow(size) {
+            const window = new Float32Array(size);
+            for (let i = 0; i < size; i++) {
+                window[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (size - 1)));
+            }
+            return window;
+        }
+
+        // 简化的IFFT实现
+        function ifft(complexData, N) {
+            // 复制数据
+            const data = new Float32Array(complexData);
+
+            // 共轭
+            for (let i = 1; i < N * 2; i += 2) {
+                data[i] = -data[i];
+            }
+
+            // 执行FFT
+            fft(data, N);
+
+            // 归一化并共轭
+            const result = new Float32Array(N);
+            for (let i = 0; i < N; i++) {
+                result[i] = data[i * 2] / N; // 只取实部
+            }
+
+            return result;
+        }
+
+        // FFT实现（Cooley-Tukey算法）
+        function fft(data, N) {
+            // 位反转
+            const j = new Array(N);
+            j[0] = 0;
+            for (let i = 1; i < N; i++) {
+                j[i] = j[i >> 1] >> 1;
+                if (i & 1) j[i] |= N >> 1;
+            }
+
+            for (let i = 0; i < N; i++) {
+                if (i < j[i]) {
+                    // 交换复数
+                    let temp = data[i * 2];
+                    data[i * 2] = data[j[i] * 2];
+                    data[j[i] * 2] = temp;
+
+                    temp = data[i * 2 + 1];
+                    data[i * 2 + 1] = data[j[i] * 2 + 1];
+                    data[j[i] * 2 + 1] = temp;
+                }
+            }
+
+            // Cooley-Tukey FFT
+            for (let len = 2; len <= N; len <<= 1) {
+                const halfLen = len >> 1;
+                const step = N / len;
+
+                for (let i = 0; i < N; i += len) {
+                    for (let k = 0; k < halfLen; k++) {
+                        const angle = -2 * Math.PI * k * step / N;
+                        const wReal = Math.cos(angle);
+                        const wImag = Math.sin(angle);
+
+                        const u = i + k;
+                        const v = i + k + halfLen;
+
+                        const tReal = data[v * 2] * wReal - data[v * 2 + 1] * wImag;
+                        const tImag = data[v * 2] * wImag + data[v * 2 + 1] * wReal;
+
+                        data[v * 2] = data[u * 2] - tReal;
+                        data[v * 2 + 1] = data[u * 2 + 1] - tImag;
+
+                        data[u * 2] += tReal;
+                        data[u * 2 + 1] += tImag;
+                    }
+                }
+            }
         }
 
         function playAudioBuffer(buffer) {
@@ -710,7 +853,13 @@
 
             const source = audioContext.createBufferSource();
             source.buffer = buffer;
-            source.connect(audioContext.destination);
+
+            // 添加增益控制
+            const gainNode = audioContext.createGain();
+            gainNode.gain.setValueAtTime(0.5, audioContext.currentTime); // 控制音量
+
+            source.connect(gainNode);
+            gainNode.connect(audioContext.destination);
 
             source.onended = () => {
                 isPlaying = false;
@@ -718,13 +867,15 @@
 
             source.start(0);
 
-            // 短暂播放后自动停止
+            // 使用更短的播放时间，更快的响应
             setTimeout(() => {
                 try {
-                    source.stop();
+                    // 淡出效果
+                    gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.02);
+                    source.stop(audioContext.currentTime + 0.02);
                 } catch (e) { }
                 isPlaying = false;
-            }, 100);
+            }, 60); // 减少到60ms
         }
 
         function stopAudio() {
@@ -741,21 +892,21 @@
                 ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
                 ctx.lineWidth = 2;
                 ctx.setLineDash([5, 5]);
-                
+
                 // 垂直线
                 ctx.beginPath();
                 ctx.moveTo(fingerPosition.x, 0);
                 ctx.lineTo(fingerPosition.x, canvas.height);
                 ctx.stroke();
-                
+
                 // 水平线
                 ctx.beginPath();
                 ctx.moveTo(0, fingerPosition.y);
                 ctx.lineTo(canvas.width, fingerPosition.y);
                 ctx.stroke();
-                
+
                 ctx.setLineDash([]);
-                
+
                 // 绘制手指位置圆点
                 ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
                 ctx.beginPath();
@@ -789,7 +940,7 @@
                         ctx.moveTo(lineX, y);
                         ctx.lineTo(lineX, y + height);
                         ctx.stroke();
-                        
+
                         // 添加播放头顶部标记
                         ctx.fillStyle = 'rgba(255, 255, 0, 0.9)';
                         ctx.beginPath();
