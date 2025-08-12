@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8"/>
     <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-    <title>Nachhall · 扫描播放 (优化版)</title>
+    <title>Nachhall · 扫描播放 (修复版)</title>
     <style>
         :root{color-scheme:dark}
         html,body{margin:0;height:100%;background:#000;color:#eaffff;font-family:system-ui,-apple-system,Segoe UI}
@@ -11,7 +11,7 @@
         video{max-width:100vw;max-height:100vh;display:block;opacity:.98}
         #ui{position:fixed;left:0;top:0;width:100vw;height:100vh;pointer-events:none}
         #frame{position:fixed;inset:0;pointer-events:none}
-        #info{position:fixed;top:10px;left:10px;font-size:12px;opacity:0.7;pointer-events:none}
+        #info{position:fixed;top:10px;left:10px;font-size:12px;opacity:0.7;pointer-events:none;background:rgba(0,0,0,0.5);padding:5px;border-radius:3px}
         .white{box-shadow:0 0 0 3px rgba(255,255,255,.65) inset}
         .green{box-shadow:0 0 0 4px rgba(0,255,170,.95) inset}
     </style>
@@ -25,13 +25,13 @@
     <div id="info">等待检测频谱图...</div>
 
     <script>
-        /* === 与编码页完全一致的参数 === */
+        /* === 参数设置 === */
         const SR = 16000, NFFT = 1024, HOP = 512;
         const K = NFFT/2 + 1;           // 513
         const T = 500;                  // 500 帧
-        const ENC_MARGIN = 160;         // 版面内边距
+        const ENC_MARGIN = 160;         
         const CELLX = 3, CELLY = 3;
-        const DBMIN = -80;              // dB floor
+        const DBMIN = -80;              
         const GRID_W = 2*ENC_MARGIN + T*CELLX;
         const GRID_H = 2*ENC_MARGIN + K*CELLY;
 
@@ -43,7 +43,7 @@
         let capCv = null, capCtx = null;
         let lastRect = null, lastSeenTs = 0;
         let actx = null, buffer = null, source = null, playing = false, durSec = 0;
-        let playStart = 0, playOffset = 0;
+        let playStart = 0;
 
         /* ========== 相机启动 ========== */
         async function startCam() {
@@ -63,14 +63,13 @@
             return 0.2126*d[i] + 0.7152*d[i+1] + 0.0722*d[i+2]; 
         }
 
-        /* ========== 改进的黑框检测 ========== */
+        /* ========== 黑框检测 ========== */
         function findBlackRect(img, W, H) {
             const data = img.data;
             const thr = autoThreshold(data, W, H);
-            const step = 2;
+            const step = 3;
             const col = new Float32Array(W), row = new Float32Array(H);
 
-            // 计算每列和每行的暗像素比例
             for(let x = 0; x < W; x++) {
                 let dark = 0, tot = 0;
                 for(let y = 0; y < H; y += step) {
@@ -91,8 +90,7 @@
                 row[y] = dark / Math.max(1, tot);
             }
 
-            // 找边界
-            const EDGE = 0.15; // 降低阈值，提高检测灵敏度
+            const EDGE = 0.2;
             let xL = 0; while(xL < W && col[xL] < EDGE) xL++;
             let xR = W-1; while(xR >= 0 && col[xR] < EDGE) xR--;
             let yT = 0; while(yT < H && row[yT] < EDGE) yT++;
@@ -100,16 +98,14 @@
 
             if(xR - xL < 100 || yB - yT < 100) return null;
 
-            // 纵横比验证
             const ar = (xR - xL) / (yB - yT);
-            if(ar < 0.4 || ar > 4.0) return null;
+            if(ar < 0.3 || ar > 5.0) return null;
 
             return { sx: xL, sy: yT, sw: xR - xL + 1, sh: yB - yT + 1 };
         }
 
-        /* 自适应阈值 */
         function autoThreshold(data, W, H) {
-            const N = 800, arr = new Float32Array(N);
+            const N = 500, arr = new Float32Array(N);
             for(let i = 0; i < N; i++) {
                 const x = (Math.random() * W) | 0;
                 const y = (Math.random() * H) | 0;
@@ -117,25 +113,11 @@
                 arr[i] = lumAt(data, idx);
             }
             arr.sort();
-            const p = arr[(N * 0.25) | 0]; // 使用25%分位
-            return Math.max(25, Math.min(180, p));
+            const p = arr[(N * 0.3) | 0];
+            return Math.max(30, Math.min(150, p));
         }
 
-        /* ========== 改进的双线性插值采样 ========== */
-        function bilinearSample(data, W, H, x, y) {
-            const x1 = Math.floor(x), y1 = Math.floor(y);
-            const x2 = Math.min(W-1, x1+1), y2 = Math.min(H-1, y1+1);
-            const fx = x - x1, fy = y - y1;
-            
-            const i1 = (y1*W + x1)*4, i2 = (y1*W + x2)*4;
-            const i3 = (y2*W + x1)*4, i4 = (y2*W + x2)*4;
-            
-            const v1 = lumAt(data, i1), v2 = lumAt(data, i2);
-            const v3 = lumAt(data, i3), v4 = lumAt(data, i4);
-            
-            return v1*(1-fx)*(1-fy) + v2*fx*(1-fy) + v3*(1-fx)*fy + v4*fx*fy;
-        }
-
+        /* ========== 采样频谱 ========== */
         function percentile(arr, p) {
             const i = Math.max(0, Math.min(arr.length-1, Math.floor(p*(arr.length-1))));
             return arr[i];
@@ -145,29 +127,28 @@
             const data = img.data;
             const M = new Float32Array(K * T);
             
-            // 标准网格 → 相机像素 线性映射
             const sX = rect.sw / GRID_W;
             const sY = rect.sh / GRID_H;
             
-            // 收集 ROI 亮度用于自适应对比度
+            // 简化的对比度计算
             const samp = [];
-            for(let i = 0; i < 1000; i++) {
+            for(let i = 0; i < 300; i++) {
                 const gx = ENC_MARGIN + Math.random() * (T * CELLX);
                 const gy = ENC_MARGIN + Math.random() * (K * CELLY);
                 const px = rect.sx + sX * gx;
                 const py = rect.sy + sY * gy;
-                
-                if(px >= 0 && px < W-1 && py >= 0 && py < H-1) {
-                    samp.push(bilinearSample(data, W, H, px, py));
-                }
+                const xi = Math.max(0, Math.min(W-1, px|0));
+                const yi = Math.max(0, Math.min(H-1, py|0));
+                const idx = (yi*W + xi)*4;
+                samp.push(lumAt(data, idx));
             }
             
             samp.sort((a,b) => a-b);
-            const p5 = percentile(samp, 0.05);
-            const p95 = percentile(samp, 0.95);
-            const denom = Math.max(10, p95 - p5);
+            const p10 = percentile(samp, 0.1);
+            const p90 = percentile(samp, 0.9);
+            const denom = Math.max(8, p90 - p10);
             
-            // 改进的采样：使用双线性插值 + 5x5平滑
+            // 简化采样
             for(let t = 0; t < T; t++) {
                 const gx = ENC_MARGIN + t * CELLX + (CELLX >> 1);
                 const px = rect.sx + sX * gx;
@@ -176,25 +157,15 @@
                     const gy = ENC_MARGIN + (K-1-r) * CELLY + (CELLY >> 1);
                     const py = rect.sy + sY * gy;
                     
-                    let acc = 0, cnt = 0;
-                    // 5x5 平滑核
-                    for(let dy = -2; dy <= 2; dy++) {
-                        for(let dx = -2; dx <= 2; dx++) {
-                            const x = px + dx;
-                            const y = py + dy;
-                            if(x >= 0 && x < W-1 && y >= 0 && y < H-1) {
-                                acc += bilinearSample(data, W, H, x, y);
-                                cnt++;
-                            }
-                        }
-                    }
+                    const xi = Math.max(0, Math.min(W-1, px|0));
+                    const yi = Math.max(0, Math.min(H-1, py|0));
+                    const idx = (yi*W + xi)*4;
+                    const lum = lumAt(data, idx);
                     
-                    const lum = acc / Math.max(1, cnt);
-                    let norm = (p95 - lum) / denom;   // 黑→1，白→0
+                    let norm = (p90 - lum) / denom;
                     norm = Math.max(0, Math.min(1, norm));
                     
-                    // 改进的dB映射，增强动态范围
-                    const db = DBMIN + norm * norm * (0 - DBMIN); // 平方增强对比度
+                    const db = DBMIN + norm * (0 - DBMIN);
                     M[t*K + r] = Math.pow(10, db/20);
                 }
             }
@@ -202,7 +173,7 @@
             return M;
         }
 
-        /* ========== 优化的 FFT/IFFT ========== */
+        /* ========== FFT ========== */
         function hann(N) { 
             const w = new Float32Array(N); 
             for(let n = 0; n < N; n++) 
@@ -273,27 +244,21 @@
             return { fft, ifft };
         }
 
-        const FFT = makeFFT(NFFT);      
-  /* ========== 大幅优化的 Griffin-Lim 算法 ========== */
-        async function griffinLim(M, iters = 60) {
+        const FFT = makeFFT(NFFT);     
+   /* ========== 简化稳定的 Griffin-Lim ========== */
+        async function griffinLim(M, iters = 25) {
+            console.log('开始Griffin-Lim重建，迭代次数:', iters);
+            
             const re = new Float32Array(NFFT), im = new Float32Array(NFFT);
             const re2 = new Float32Array(NFFT), im2 = new Float32Array(NFFT);
             
-            // 智能初始相位：使用随机相位但保持频率连续性
+            // 随机相位初始化
             const phase = new Float32Array(K * T);
-            for(let t = 0; t < T; t++) {
-                for(let k = 0; k < K; k++) {
-                    if(t === 0) {
-                        phase[t*K + k] = Math.random() * 2 * Math.PI;
-                    } else {
-                        // 相位连续性：基于前一帧 + 小随机扰动
-                        const prevPhase = phase[(t-1)*K + k];
-                        phase[t*K + k] = prevPhase + (Math.random() - 0.5) * 0.5;
-                    }
-                }
+            for(let i = 0; i < phase.length; i++) {
+                phase[i] = Math.random() * 2 * Math.PI;
             }
             
-            // 预计算 OLA 归一权重
+            // OLA 权重
             const L = (T-1) * HOP + NFFT;
             const y = new Float32Array(L);
             const wsum = new Float32Array(L);
@@ -305,20 +270,18 @@
                 }
             }
             
-            // 迭代重建
+            // 迭代
             for(let it = 0; it < iters; it++) {
                 y.fill(0);
                 
-                // ISTFT: 频域 → 时域
+                // ISTFT
                 for(let t = 0; t < T; t++) {
-                    // 构建复数频谱
                     for(let k = 0; k < K; k++) { 
                         const mag = M[t*K + k]; 
                         re[k] = mag * Math.cos(phase[t*K + k]); 
                         im[k] = mag * Math.sin(phase[t*K + k]); 
                     }
                     
-                    // 镜像对称（实信号）
                     for(let k = K; k < NFFT; k++) { 
                         re[k] = 0; 
                         im[k] = 0; 
@@ -342,7 +305,7 @@
                 }
                 
                 if(it < iters - 1) {
-                    // STFT: 时域 → 频域，更新相位
+                    // STFT 更新相位
                     for(let t = 0; t < T; t++) {
                         const off = t * HOP;
                         for(let n = 0; n < NFFT; n++) { 
@@ -352,70 +315,47 @@
                         
                         FFT.fft(re2, im2);
                         
-                        // 强制幅度一致性 + 相位平滑
                         for(let k = 0; k < K; k++) {
-                            const mag = Math.sqrt(re2[k]*re2[k] + im2[k]*im2[k]);
-                            if(mag > 1e-10) {
-                                const targetMag = M[t*K + k];
-                                // 强制匹配目标幅度
-                                re2[k] = re2[k] * targetMag / mag;
-                                im2[k] = im2[k] * targetMag / mag;
-                            }
-                            
-                            let newPhase = Math.atan2(im2[k], re2[k]);
-                            
-                            // 相位平滑：与相邻帧的相位保持连续性
-                            if(t > 0 && k > 0) {
-                                const prevPhase = phase[(t-1)*K + k];
-                                const diff = newPhase - prevPhase;
-                                // 处理相位跳跃
-                                if(diff > Math.PI) newPhase -= 2*Math.PI;
-                                else if(diff < -Math.PI) newPhase += 2*Math.PI;
-                                
-                                // 轻微平滑
-                                newPhase = 0.8 * newPhase + 0.2 * prevPhase;
-                            }
-                            
-                            phase[t*K + k] = newPhase;
+                            phase[t*K + k] = Math.atan2(im2[k], re2[k]);
                         }
                     }
                 }
                 
-                // 每10次迭代给个进度提示
-                if(it % 10 === 0) {
-                    info.textContent = `重建音频中... ${Math.round(it/iters*100)}%`;
-                    await new Promise(r => setTimeout(r, 1));
+                // 进度更新
+                if(it % 5 === 0) {
+                    const progress = Math.round(it/iters*100);
+                    info.textContent = `重建音频中... ${progress}%`;
+                    console.log(`Griffin-Lim进度: ${progress}%`);
+                    await new Promise(r => setTimeout(r, 0));
                 }
             }
             
-            // 改进的后处理
+            // 后处理
             let peak = 1e-9; 
             for(let i = 0; i < y.length; i++) 
                 peak = Math.max(peak, Math.abs(y[i]));
             
-            // 动态范围压缩 + 轻微限幅
-            const g = 0.8 / peak; 
-            for(let i = 0; i < y.length; i++) {
-                y[i] *= g;
-                // 软限幅，保持音质
-                y[i] = Math.tanh(y[i] * 1.2) * 0.9;
+            if(peak > 0) {
+                const g = 0.8 / peak; 
+                for(let i = 0; i < y.length; i++) {
+                    y[i] = Math.tanh(y[i] * g) * 0.7;
+                }
             }
             
-            // 简单的高频增强（提升清晰度）
-            for(let i = 1; i < y.length - 1; i++) {
-                const highFreq = (y[i-1] - 2*y[i] + y[i+1]) * 0.1;
-                y[i] += highFreq;
-            }
-            
-            info.textContent = '音频重建完成';
+            console.log('Griffin-Lim完成，音频长度:', y.length, '采样');
             return y;
         }
 
-        /* ========== 播放控制（修复循环问题） ========== */
+        /* ========== 播放控制 ========== */
         function stopSource() { 
             try { 
-                source && source.stop(0); 
-            } catch(_) {} 
+                if(source) {
+                    source.stop(0);
+                    source.disconnect();
+                }
+            } catch(e) {
+                console.log('停止音源时出错:', e);
+            } 
             source = null; 
             playing = false; 
         }
@@ -429,12 +369,15 @@
             if(actx.state === 'suspended') { 
                 try { 
                     await actx.resume(); 
-                } catch(_) {} 
+                } catch(e) {
+                    console.log('恢复音频上下文失败:', e);
+                } 
             }
             return actx.state === 'running';
         }
 
         function playBuffer(y) {
+            console.log('开始播放音频，长度:', y.length);
             stopSource();
             
             const buf = actx.createBuffer(1, y.length, SR);
@@ -447,15 +390,15 @@
             source.loop = true;
             source.connect(actx.destination);
             
-            playOffset = 0;
             playStart = actx.currentTime;
             source.start(0);
             playing = true;
             
+            console.log('音频开始播放，时长:', durSec.toFixed(2), '秒');
             info.textContent = `播放中 (${durSec.toFixed(1)}s)`;
         }
 
-        /* ========== 主循环：检测和播放 ========== */
+        /* ========== 主循环 ========== */
         let debounceRebuild = 0;
         
         async function loop() {
@@ -473,28 +416,35 @@
                 frame.className = 'white'; 
             }
             
-            // 检测到框就尝试播放
             if(hasRect) {
                 const moved = !lastRect || 
-                    Math.abs(rect.sx - lastRect.sx) > 8 || 
-                    Math.abs(rect.sy - lastRect.sy) > 8 || 
-                    Math.abs(rect.sw - lastRect.sw) > 12 || 
-                    Math.abs(rect.sh - lastRect.sh) > 12;
+                    Math.abs(rect.sx - lastRect.sx) > 10 || 
+                    Math.abs(rect.sy - lastRect.sy) > 10 || 
+                    Math.abs(rect.sw - lastRect.sw) > 15 || 
+                    Math.abs(rect.sh - lastRect.sh) > 15;
                 
                 lastRect = rect;
                 
-                if(moved || (now - debounceRebuild > 2000) || !playing) {
+                if(moved || (now - debounceRebuild > 3000) || !playing) {
                     debounceRebuild = now;
                     if(await ensureAudio()) {
+                        console.log('检测到频谱图变化，开始重建');
                         info.textContent = '检测到频谱图，开始采样...';
-                        const M = sampleMFromRect(img, W, H, rect);
-                        const y = await griffinLim(M, 60);  // 60次迭代
-                        playBuffer(y);
+                        
+                        try {
+                            const M = sampleMFromRect(img, W, H, rect);
+                            console.log('频谱采样完成');
+                            const y = await griffinLim(M, 25);
+                            playBuffer(y);
+                        } catch(e) {
+                            console.error('音频重建失败:', e);
+                            info.textContent = '音频重建失败';
+                        }
                     }
                 }
             } else {
-                // 离开画面 0.8s 后暂停
-                if(playing && now - lastSeenTs > 800) { 
+                if(playing && now - lastSeenTs > 1000) { 
+                    console.log('频谱图丢失，停止播放');
                     stopSource(); 
                     info.textContent = '频谱图丢失，播放暂停';
                 }
@@ -504,55 +454,51 @@
             requestAnimationFrame(loop);
         }
 
-        /* ========== 修复的 UI 叠加层：正确的循环播放头 ========== */
+        /* ========== 修复的播放头显示 ========== */
         function drawUIOverlay(rect) {
             const ctx = ui.getContext('2d');
             const W = ui.width = innerWidth;
             const H = ui.height = innerHeight;
             ctx.clearRect(0, 0, W, H);
             
-            if(!playing || !buffer || !rect) return;
+            if(!playing || !buffer || !rect || !actx) return;
             
-            // 修复的时间计算：确保循环
-            const now = actx.currentTime;
-            const elapsed = (now - playStart + playOffset) % durSec;
-            const progress = elapsed / durSec;  // 0 到 1
-            const col = Math.floor(progress * T) % T;  // 确保在 0 到 T-1 之间循环
-            
-            // rect 在相机像素；转换到屏幕像素
-            const vRect = cam.getBoundingClientRect();
-            const sx = vRect.width / capCv.width;
-            const sy = vRect.height / capCv.height;
-            const ox = vRect.left, oy = vRect.top;
-            
-            // 标准网格列中心 → 相机像素
-            const sX = rect.sw / GRID_W;
-            const gx = ENC_MARGIN + col * CELLX + (CELLX >> 1);
-            const px = rect.sx + sX * gx;
-            
-            // 相机像素 → 屏幕像素
-            const screenX = Math.round(ox + px * sx);
-            
-            // 绘制播放头
-            ctx.strokeStyle = 'rgba(255,255,255,.95)';
-            ctx.lineWidth = 3;
-            ctx.shadowColor = 'rgba(0,0,0,0.5)';
-            ctx.shadowBlur = 2;
-            
-            ctx.beginPath();
-            ctx.moveTo(screenX, oy);
-            ctx.lineTo(screenX, oy + vRect.height);
-            ctx.stroke();
-            
-            // 重置阴影
-            ctx.shadowColor = 'transparent';
-            ctx.shadowBlur = 0;
-            
-            // 在播放头顶部显示进度
-            ctx.fillStyle = 'rgba(255,255,255,0.9)';
-            ctx.font = '12px monospace';
-            ctx.textAlign = 'center';
-            ctx.fillText(`${(progress*100).toFixed(0)}%`, screenX, oy + 15);
+            try {
+                // 修复的时间计算
+                const now = actx.currentTime;
+                const elapsed = now - playStart;
+                const progress = (elapsed % durSec) / durSec;  // 0 到 1
+                const col = Math.floor(progress * T) % T;  // 0 到 T-1，确保循环
+                
+                // 坐标转换
+                const vRect = cam.getBoundingClientRect();
+                const sx = vRect.width / capCv.width;
+                const sy = vRect.height / capCv.height;
+                const ox = vRect.left, oy = vRect.top;
+                
+                const sX = rect.sw / GRID_W;
+                const gx = ENC_MARGIN + col * CELLX + (CELLX >> 1);
+                const px = rect.sx + sX * gx;
+                
+                const screenX = Math.round(ox + px * sx);
+                
+                // 绘制播放头
+                ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(screenX, oy);
+                ctx.lineTo(screenX, oy + vRect.height);
+                ctx.stroke();
+                
+                // 显示进度
+                ctx.fillStyle = 'rgba(255,255,255,0.8)';
+                ctx.font = '11px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText(`${(progress*100).toFixed(0)}%`, screenX, oy + 12);
+                
+            } catch(e) {
+                console.log('绘制播放头时出错:', e);
+            }
         }
 
         /* ========== 启动 ========== */
@@ -561,10 +507,11 @@
                 info.textContent = '启动相机中...';
                 await startCam();
                 info.textContent = '相机就绪，请对准频谱图';
+                console.log('相机启动成功');
                 loop();
             } catch(e) {
                 info.textContent = '相机启动失败：请在 HTTPS 下访问并允许相机权限';
-                console.error(e);
+                console.error('相机启动失败:', e);
             }
         })();
     </script>
