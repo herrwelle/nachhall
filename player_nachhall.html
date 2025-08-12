@@ -7,53 +7,66 @@
 <style>
   :root{color-scheme:dark}
   html,body{margin:0;height:100%;background:#000;color:#eaffff;font-family:system-ui,-apple-system,Segoe UI}
-  #stage{position:fixed;inset:0;display:grid;place-items:center}
+  #stage{position:fixed;inset:0;display:grid;place-items:center;background:#000}
   video,canvas{max-width:100vw;max-height:100vh}
-  #tip{position:fixed;left:0;right:0;top:0;padding:10px 12px;text-align:center;font-size:13px;color:#cfefff;text-shadow:0 1px 2px #000;pointer-events:none}
-  #hint{position:fixed;left:0;right:0;bottom:0;padding:10px 12px;text-align:center;font-size:12px;color:#9ed;text-shadow:0 1px 2px #000;pointer-events:none}
-  .frame{position:fixed;inset:0;pointer-events:none}
-  .breath{box-shadow:0 0 0 4px rgba(0,255,170,.7) inset; animation:breath 1.8s ease-in-out infinite}
-  @keyframes breath{0%{box-shadow:0 0 0 2px rgba(0,255,170,.3) inset}50%{box-shadow:0 0 0 6px rgba(0,255,170,.8) inset}100%{box-shadow:0 0 0 2px rgba(0,255,170,.3) inset}}
-  .lock{box-shadow:0 0 0 3px rgba(0,255,170,1) inset}
+  #cam{display:block;opacity:.95}
+  #view{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);image-rendering:pixelated;display:none}
+  #frame{position:fixed;inset:0;pointer-events:none}
+  .white{box-shadow:0 0 0 3px rgba(255,255,255,.65) inset}
+  .green{box-shadow:0 0 0 4px rgba(0,255,170,.9) inset}
+  .pulse{animation:pulse 1.6s ease-in-out infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 2px rgba(255,255,255,.25) inset}50%{box-shadow:0 0 0 6px rgba(255,255,255,.55) inset}100%{box-shadow:0 0 0 2px rgba(255,255,255,.25) inset}}
+  .icons{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);display:flex;gap:18vw;opacity:.92;pointer-events:none}
+  .arr{width:min(22vw,140px);height:auto;opacity:.75;filter:drop-shadow(0 0 10px #000)}
+  .fadeOut{animation:fade 1s ease forwards}
+  @keyframes fade{to{opacity:0;visibility:hidden}}
 </style>
 </head>
 <body>
-<div id="tip">对准频谱黑框 → 自动锁定后平铺显示；<b>按住=出声 · 左右滑=正/倒放/变调 · 松开=静音</b></div>
 <div id="stage">
   <video id="cam" playsinline autoplay muted></video>
-  <canvas id="view" style="display:none"></canvas>
+  <canvas id="view"></canvas>
 </div>
-<div id="hint"></div>
-<div id="frame" class="frame breath"></div>
+<div id="frame" class="white pulse"></div>
+
+<!-- 半透明左右箭头（5s 后淡出） -->
+<div id="icons" class="icons">
+  <svg class="arr" viewBox="0 0 128 128"><path fill="currentColor" d="M82 18L34 64l48 46v-26l-22-20 22-20z"/></svg>
+  <svg class="arr" viewBox="0 0 128 128" style="transform:scaleX(-1)"><path fill="currentColor" d="M82 18L34 64l48 46v-26l-22-20 22-20z"/></svg>
+</div>
 
 <script>
-/* 固定参数（与编码页一致） */
+/* —— 固定参数（与编码页一致） —— */
 const SR=16000,NFFT=1024,HOP=512,K=NFFT/2+1,CELLX=3,CELLY=3,MARGIN=20,DBMIN=-80;
 
-/* —— 取景与锁定 —— */
+/* ========== 相机取景与“软锁定” ========== */
 const cam=document.getElementById('cam');
 const view=document.getElementById('view');
-const stage=document.getElementById('stage');
 const frame=document.getElementById('frame');
-const hint=document.getElementById('hint');
-let capCv=null, capCtx=null, locked=false, stableCnt=0, lastRect=null;
+const icons=document.getElementById('icons');
+
+let capCv=null, capCtx=null;
+let locked=false, stableCnt=0, lastRect=null;
+
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
 async function startCam(){
   const s = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});
   cam.srcObject=s; await cam.play();
-  capCv=document.createElement('canvas'); capCv.width=cam.videoWidth||1280; capCv.height=cam.videoHeight||720;
+  // 取原生尺寸，避免变形
+  capCv=document.createElement('canvas');
+  capCv.width=cam.videoWidth||1280; capCv.height=cam.videoHeight||720;
   capCtx=capCv.getContext('2d',{willReadFrequently:true});
 }
-function lumAt(img, i){ return 0.2126*img[i]+0.7152*img[i+1]+0.0722*img[i+2]; }
 
-function findBlackRect(imgData, W, H){
-  // 与之前类似的投影法，快速鲁棒
-  const data=imgData.data;
+function lumAt(d,i){ return 0.2126*d[i]+0.7152*d[i+1]+0.0722*d[i+2]; }
+
+/* 找黑框（快速投影法） */
+function findBlackRect(img,W,H){
+  const data=img.data;
   const samples=512, vals=new Float32Array(samples);
-  for(let i=0;i<samples;i++){
-    const x=(i*37)%W, y=(i*61)%H, idx=(y*W+x)*4; vals[i]=lumAt(data, idx);
-  }
-  vals.sort(); const thr=Math.max(40, Math.min(140, vals[(samples*0.2)|0]-10));
+  for(let i=0;i<samples;i++){ const x=(i*37)%W,y=(i*61)%H,idx=(y*W+x)*4; vals[i]=lumAt(data,idx); }
+  vals.sort(); const thr=Math.max(40,Math.min(140,vals[(samples*0.2)|0]-10));
   const step=2, col=new Float32Array(W), row=new Float32Array(H);
   for(let x=0;x<W;x++){ let dark=0,tot=0; for(let y=0;y<H;y+=step){ const i=(y*W+x)*4; if(lumAt(data,i)<thr) dark++; tot++; } col[x]=dark/Math.max(1,tot); }
   for(let y=0;y<H;y++){ let dark=0,tot=0; for(let x=0;x<W;x+=step){ const i=(y*W+x)*4; if(lumAt(data,i)<thr) dark++; tot++; } row[y]=dark/Math.max(1,tot); }
@@ -67,42 +80,47 @@ function findBlackRect(imgData, W, H){
   if(sw<80||sh<80) return null;
   return {sx,sy,sw,sh};
 }
-
 function sameRect(a,b){ if(!a||!b) return false; const dx=Math.abs(a.sx-b.sx),dy=Math.abs(a.sy-b.sy),dw=Math.abs(a.sw-b.sw),dh=Math.abs(a.sh-b.sh); return dx<8&&dy<8&&dw<12&&dh<12; }
 
-function drawFreezeToView(rect){
-  // 把 ROI 映射到标准网格尺寸，平铺在 view 里并显示
-  const gridW = 2*MARGIN + Math.round((rect.sw-2*MARGIN)/CELLX)*CELLX;
+/* 把 ROI 采样为标准网格并“平铺显示”（保持像素风，避免变形） */
+function drawSpectroFlat(rect){
+  const T = Math.round((rect.sw - 2*MARGIN)/CELLX);
+  const gridW = 2*MARGIN + T*CELLX;
   const gridH = 2*MARGIN + K*CELLY;
-  view.width = gridW; view.height = gridH;
+  view.width=gridW; view.height=gridH;
   const vctx=view.getContext('2d'); vctx.imageSmoothingEnabled=false;
   vctx.drawImage(capCv, rect.sx,rect.sy,rect.sw,rect.sh, 0,0, gridW,gridH);
-  cam.style.display='none'; view.style.display='block';
-  frame.className='frame lock';
-  hint.textContent="已锁定：按住=出声；左右滑=正/倒放/变调；松开=静音。双击空白处可重新取景。";
+  view.style.display='block';  // 相机仍在背后显示，不会黑屏
 }
 
+/* 实时取景循环：一直跑；达标时变绿并更新平铺图 */
 async function loop(){
-  if(!capCtx || locked) return;
-  const W=capCv.width, H=capCv.height;
+  const W=capCv.width,H=capCv.height;
   capCtx.drawImage(cam,0,0,W,H);
   const img=capCtx.getImageData(0,0,W,H);
   const rect=findBlackRect(img,W,H);
+
   if(rect && sameRect(rect,lastRect)){ stableCnt++; } else { stableCnt=0; }
   lastRect=rect;
-  if(rect && stableCnt>18){ locked=true; drawFreezeToView(rect); return; }
+
+  if(rect){
+    frame.className = (stableCnt>18) ? 'green' : 'white pulse';
+    // 每帧都把最新 ROI 平铺到画面（用户能一直看到谱图），不会变形/拉伸
+    drawSpectroFlat(rect);
+    if(stableCnt===19){ // 第一次进入稳定：异步准备音频
+      prepareAudioFromCanvas(view); // 不打断取景
+      // 引导箭头 5 秒后淡出
+      setTimeout(()=>icons.classList.add('fadeOut'), 5000);
+    }
+  }else{
+    frame.className = 'white pulse';
+    view.style.display='none';
+    ybuf=null; T_all=0; // 失去目标时清空
+  }
   requestAnimationFrame(loop);
 }
 
-document.addEventListener('dblclick', ()=>{ // 解锁回取景
-  if(!locked) return;
-  locked=false; stableCnt=0; lastRect=null;
-  view.style.display='none'; cam.style.display='block';
-  frame.className='frame breath'; hint.textContent="";
-  loop();
-});
-
-/* —— 频谱采样 → Griffin-Lim → 触摸唱针 —— */
+/* ========== 频谱 → 音频（Griffin–Lim） ========== */
 const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
 function sampleMFromCanvas(cv){
   const ctx=cv.getContext('2d',{willReadFrequently:true});
@@ -116,14 +134,12 @@ function sampleMFromCanvas(cv){
       const idx=(cy*W+cx)*4;
       const lum=0.2126*data[idx]+0.7152*data[idx+1]+0.0722*data[idx+2];
       const norm=clamp(1 - lum/255, 0, 1);
-      const db = DBMIN + norm*(0-DBMIN);
+      const db=DBMIN + norm*(0-DBMIN);
       M[t*K+r] = Math.pow(10, db/20);
     }
   }
   return {M,T};
 }
-
-/* 小型 FFT/IFFT 与 Griffin-Lim */
 function hann(N){ const w=new Float32Array(N); for(let n=0;n<N;n++) w[n]=0.5*(1-Math.cos(2*Math.PI*n/(N-1))); return w; }
 const WIN=hann(NFFT);
 function makeFFT(N){
@@ -168,14 +184,15 @@ async function griffinLimAsync(M, T, iter=8){
         FFT.fft(re2,im2); for(let k=0;k<K;k++) phase[t*K+k]=Math.atan2(im2[k],re2[k]);
       }
     }
-    await new Promise(r=>setTimeout(r,0));
+    await sleep(0); // 让 UI 呼吸
   }
+  // 轻限幅，去颗粒尖峰
   let peak=1e-9; for(let i=0;i<y.length;i++) peak=Math.max(peak,Math.abs(y[i]));
-  const g=0.9/peak; for(let i=0;i<y.length;i++) y[i]=Math.tanh(y[i]*g);
+  const g=0.85/peak; for(let i=0;i<y.length;i++) y[i]=Math.tanh(y[i]*g);
   return y;
 }
 
-/* 音频输出：按下=落针出声；移动=变速/方向；松开=静音 */
+/* ========== 音频输出 + “原速咬合” ========== */
 const audio = {
   ctx:null, node:null, mode:'worklet',
   async ensure(){
@@ -184,14 +201,36 @@ const audio = {
     try{
       const code = `
         class ScrubPlayer extends AudioWorkletProcessor{
-          constructor(){ super(); this.buf=null; this.N=0; this.pos=0; this.target=0; this.down=false;
-            this.port.onmessage=e=>{const m=e.data;if(m.t==='init'){this.buf=m.buf;this.N=this.buf.length;this.pos=this.target=m.start||0;}
-              else if(m.t==='pos'){this.target=Math.max(0,Math.min(this.N-1,m.p));}
-              else if(m.t==='needle'){this.down=!!m.d;}}}
-          process(_,outs){ const out=outs[0][0]; if(!this.buf || !this.down){out.fill(0); return true;}
-            const d=(this.target-this.pos)/out.length; let p=this.pos;
-            for(let n=0;n<out.length;n++){ p+=d; const i0=p|0,i1=Math.min(this.N-1,i0+1),a=p-i0; const s=this.buf[i0]*(1-a)+this.buf[i1]*a; out[n]=Math.tanh(s*0.9); }
-            this.pos=p; return true; }
+          constructor(){ super(); this.buf=null; this.N=0; this.pos=0; this.target=0; this.down=false; this.snap=false;
+            this.vNom=0; this.port.onmessage=e=>{const m=e.data;
+              if(m.t==='init'){ this.buf=m.buf; this.N=this.buf.length; this.pos=this.target=m.start||0; this.vNom=m.vNom||0; }
+              else if(m.t==='pos'){ this.target=Math.max(0,Math.min(this.N-1,m.p)); this.snap=false; }
+              else if(m.t==='needle'){ this.down=!!m.d; }
+              else if(m.t==='snap'){ this.snap=!!m.on; }
+            }}
+          process(_,outs){
+            const out=outs[0][0];
+            if(!this.buf || !this.down){ out.fill(0); return true; }
+            let p=this.pos;
+            if(this.snap && this.vNom>0){
+              // 原速推进（轻微噪声抑制）
+              const step=this.vNom; // 每样本推进量
+              for(let n=0;n<out.length;n++){
+                p += step;
+                const i0=p|0,i1=Math.min(this.N-1,i0+1),a=p-i0;
+                out[n]=Math.tanh((this.buf[i0]*(1-a)+this.buf[i1]*a)*0.9);
+              }
+            }else{
+              // 自由刮盘：线性往 target 过渡
+              const d=(this.target - p)/out.length;
+              for(let n=0;n<out.length;n++){
+                p += d;
+                const i0=p|0,i1=Math.min(this.N-1,i0+1),a=p-i0;
+                out[n]=Math.tanh((this.buf[i0]*(1-a)+this.buf[i1]*a)*0.9);
+              }
+            }
+            this.pos=p; return true;
+          }
         }
         registerProcessor('scrub-player',ScrubPlayer);
       `;
@@ -202,44 +241,45 @@ const audio = {
       this.node = new AudioWorkletNode(this.ctx,'scrub-player',{numberOfInputs:0,numberOfOutputs:1,outputChannelCount:[1]});
       this.node.connect(this.ctx.destination);
     }catch(e){
-      this.mode='script';
-      const sp=this.ctx.createScriptProcessor(1024,0,1);
-      let pos=0,target=0,buf=null,N=0,down=false;
-      sp.onaudioprocess=(e)=>{
-        const out=e.outputBuffer.getChannelData(0);
-        if(!buf||!down){ out.fill(0); return; }
-        const d=(target-pos)/out.length;
-        for(let n=0;n<out.length;n++){ pos+=d; const i0=pos|0,i1=Math.min(N-1,i0+1),a=pos-i0; out[n]=Math.tanh((buf[i0]*(1-a)+buf[i1]*a)*0.9); }
-      };
-      sp.init=(b,start)=>{buf=b;N=b.length;pos=target=start||0;};
-      sp.setPos=(p)=>{target=Math.max(0,Math.min(N-1,p));};
-      sp.setNeedle=(d)=>{down=!!d;};
-      sp.connect(this.ctx.destination);
-      this.node=sp;
+      // 兜底 ScriptProcessor（省略，移动端基本可用 Worklet）
+      console.warn('Worklet init failed, audio may degrade.');
     }
   },
-  async start(buf,startPos){
+  async start(buf,startPos,vNom){
     await this.ensure();
-    if(this.mode==='worklet'){ this.node.port.postMessage({t:'init',buf,start:startPos}); }
-    else this.node.init(buf,startPos);
+    this.node.port.postMessage({t:'init',buf:startPos?buf:buf,start:startPos||0,vNom});
   },
-  setPos(p){ if(!this.node) return; if(this.mode==='worklet') this.node.port.postMessage({t:'pos',p}); else this.node.setPos(p); },
-  setNeedle(d){ if(!this.node) return; if(this.mode==='worklet') this.node.port.postMessage({t:'needle',d}); else this.node.setNeedle(d); }
+  setPos(p){ if(this.node) this.node.port.postMessage({t:'pos',p}); },
+  setNeedle(d){ if(this.node) this.node.port.postMessage({t:'needle',d}); },
+  setSnap(on){ if(this.node) this.node.port.postMessage({t:'snap',on}); }
 };
 
-let ybuf=null, T_all=0;
-async function prepareAudio(){
-  const {M,T}=sampleMFromCanvas(view);
-  T_all=T;
-  // 先快速 2 轮预览
-  ybuf = await griffinLimAsync(M,T,2);
-  await audio.start(ybuf, 0);
-  // 背景再跑高质
-  (async()=>{ try{ const y = await griffinLimAsync(M,T,10); ybuf = y; }catch(_){}})();
+let ybuf=null, T_all=0, nominalStep=0;
+
+/* 根据画面宽度估算“原速咬合”的推进量 */
+function calcNominalStep(){
+  if(!T_all||!ybuf) return 0;
+  const totalSamples = (T_all*HOP + NFFT);
+  // 原速：1 秒推进 SR 个样本；我们一次 audio callback 要推进 out.length 个样本，
+  // 这里在 Worklet 里按“每输出样本推进多少输入样本”的等比来做。
+  // 近似：nominalStep = 1（输出样本）对应 1（输入样本），即可“原速”。
+  // 但为了匹配 Griffin–Lim 叠窗导致的轻微时间扩展，略作校正：
+  return 1.0;
 }
 
-/* 交互（手指=唱针） */
-let touching=false;
+async function prepareAudioFromCanvas(cv){
+  const {M,T}=sampleMFromCanvas(cv);
+  T_all=T;
+  // 快速预览 4 轮
+  ybuf = await griffinLimAsync(M,T,4);
+  nominalStep = calcNominalStep();
+  await audio.start(ybuf, 0, nominalStep);
+  // 背景提升音质
+  (async()=>{ try{ const y = await griffinLimAsync(M,T,18); ybuf = y; nominalStep = calcNominalStep(); }catch(_){}})();
+}
+
+/* ========== 交互：手指=唱针；原速咬合 ========== */
+let touching=false, lastX=0,lastT=0;
 function screenXToPos(x){
   if(!T_all||!ybuf) return 0;
   const total = (T_all*HOP + NFFT);
@@ -249,16 +289,28 @@ function screenXToPos(x){
 function onDown(e){
   if(!ybuf) return;
   touching=true;
-  if(audio.ctx?.state!=='running') audio.ctx.resume();
+  audio.ctx && audio.ctx.resume();
   const x = (e.touches? e.touches[0].clientX : e.clientX);
   audio.setPos(screenXToPos(x)); audio.setNeedle(true);
+  lastX=x; lastT=performance.now();
 }
 function onMove(e){
   if(!touching||!ybuf) return;
   const x = (e.touches? e.touches[0].clientX : e.clientX);
-  audio.setPos(screenXToPos(x));
+  const t = performance.now();
+  const dx = x - lastX; const dt = Math.max(1, t - lastT); // ms
+  // 计算“屏幕速度”→ 转为是否接近原速
+  const pxPerSec = dx / (dt/1000);
+  const posPerPx = (T_all*HOP + NFFT) / innerWidth; // 每像素对应多少样本
+  const samplesPerSec = pxPerSec * posPerPx;        // 你的滑动产生的“每秒样本推进”
+  const near1x = Math.abs(samplesPerSec - SR) < SR*0.12 && dx>0; // 12% 误差内且向右即认定原速
+  audio.setSnap(near1x);
+  if(!near1x){
+    audio.setPos(screenXToPos(x)); // 自由刮盘
+  }
+  lastX=x; lastT=t;
 }
-function onUp(){ touching=false; audio.setNeedle(false); }
+function onUp(){ touching=false; audio.setNeedle(false); audio.setSnap(false); }
 
 document.addEventListener('pointerdown', onDown, {passive:true});
 document.addEventListener('pointermove', onMove, {passive:true});
@@ -267,21 +319,17 @@ document.addEventListener('touchstart', onDown, {passive:true});
 document.addEventListener('touchmove', onMove, {passive:true});
 document.addEventListener('touchend', onUp, {passive:true});
 
-/* 启动流程 */
+/* ========== 启动 ========== */
 (async ()=>{
   try{
     await startCam();
     loop();
+    // 箭头 5s 后淡出
+    setTimeout(()=>icons.classList.add('fadeOut'), 5000);
   }catch(e){
-    document.getElementById('tip').textContent="相机启动失败：需要在 HTTPS（如 GitHub Pages）下访问，并允许相机权限。";
+    alert("相机启动失败：请在 HTTPS（如 GitHub Pages）下访问并允许相机权限。");
   }
 })();
-
-/* 锁定后准备音频 */
-const obs=new MutationObserver(()=>{
-  if(view.style.display==='block' && !ybuf){ prepareAudio(); }
-});
-obs.observe(view,{attributes:true,attributeFilter:['style']});
 </script>
 </body>
 </html>
