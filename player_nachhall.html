@@ -3,60 +3,138 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-<title>离线播放 · 按下=落针 · 滑动=正/倒放/变调 · 松开=静音</title>
+<title>Nachhall · 扫描播放</title>
 <style>
-  :root{color-scheme:dark light}
-  html,body{margin:0;height:100%;background:#000;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}
-  .top{position:fixed;left:0;right:0;top:0;padding:10px 12px;font-size:13px;background:linear-gradient(#0009,#0000)}
-  .pane{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
-  .card{background:#001a1acc;border:1px solid #0ff;border-radius:12px;padding:12px 14px;display:flex;gap:10px;align-items:center}
-  .card input{color:#fff}
-  .msg{position:fixed;bottom:3.1rem;left:0;right:0;text-align:center;font-weight:700;text-shadow:0 1px 2px #000}
-  .hint{position:fixed;bottom:1.4rem;left:0;right:0;text-align:center;font-size:12px;color:#cfefff;text-shadow:0 1px 2px #000}
-  .ui{position:fixed;left:0;right:0;bottom:0;display:flex;justify-content:center;gap:14px;pointer-events:none}
-  .ui .chip{display:flex;align-items:center;gap:8px;color:#eaffff;background:#001a1acc;border:1px solid #0ff;border-radius:20px;padding:8px 12px;margin-bottom:10px;font-size:13px}
-  .ui .arr{opacity:.9}
-  canvas{display:none}
-  img.preview{max-width:92vw;max-height:72vh;border-radius:10px;border:1px solid #0ff44}
+  :root{color-scheme:dark}
+  html,body{margin:0;height:100%;background:#000;color:#eaffff;font-family:system-ui,-apple-system,Segoe UI}
+  #stage{position:fixed;inset:0;display:grid;place-items:center}
+  video,canvas{max-width:100vw;max-height:100vh}
+  #tip{position:fixed;left:0;right:0;top:0;padding:10px 12px;text-align:center;font-size:13px;color:#cfefff;text-shadow:0 1px 2px #000;pointer-events:none}
+  #hint{position:fixed;left:0;right:0;bottom:0;padding:10px 12px;text-align:center;font-size:12px;color:#9ed;text-shadow:0 1px 2px #000;pointer-events:none}
+  .frame{position:fixed;inset:0;pointer-events:none}
+  .breath{box-shadow:0 0 0 4px rgba(0,255,170,.7) inset; animation:breath 1.8s ease-in-out infinite}
+  @keyframes breath{0%{box-shadow:0 0 0 2px rgba(0,255,170,.3) inset}50%{box-shadow:0 0 0 6px rgba(0,255,170,.8) inset}100%{box-shadow:0 0 0 2px rgba(0,255,170,.3) inset}}
+  .lock{box-shadow:0 0 0 3px rgba(0,255,170,1) inset}
 </style>
 </head>
 <body>
-<div class="top">选择/拍照一张<b>频谱图片</b>（印刷品或本工具导出的 PNG）。识别后：<b>按住=出声，左右滑=正/倒放/变调，松开=静音</b>。</div>
-
-<div class="pane">
-  <div class="card">
-    <label>选择/拍照频谱：
-      <input id="imgIn" type="file" accept="image/*" capture="environment">
-    </label>
-  </div>
+<div id="tip">对准频谱黑框 → 自动锁定后平铺显示；<b>按住=出声 · 左右滑=正/倒放/变调 · 松开=静音</b></div>
+<div id="stage">
+  <video id="cam" playsinline autoplay muted></video>
+  <canvas id="view" style="display:none"></canvas>
 </div>
-
-<div id="msg" class="msg">等待选择图片…</div>
-<div class="ui"><div class="chip"><span class="arr">←</span><span>按住并左右滑动以播放/倒放 · 滑得越快音高越高 · 松开即静音</span><span class="arr">→</span></div></div>
-<div id="hint" class="hint"></div>
-
-<canvas id="cap"></canvas>
+<div id="hint"></div>
+<div id="frame" class="frame breath"></div>
 
 <script>
-/* 与编码页一致的固定参数 */
-const SR=16000, NFFT=1024, HOP=512, K=NFFT/2+1, CELLX=3, CELLY=3, MARGIN=20, DBMIN=-80;
+/* 固定参数（与编码页一致） */
+const SR=16000,NFFT=1024,HOP=512,K=NFFT/2+1,CELLX=3,CELLY=3,MARGIN=20,DBMIN=-80;
 
-/* 工具 */
+/* —— 取景与锁定 —— */
+const cam=document.getElementById('cam');
+const view=document.getElementById('view');
+const stage=document.getElementById('stage');
+const frame=document.getElementById('frame');
+const hint=document.getElementById('hint');
+let capCv=null, capCtx=null, locked=false, stableCnt=0, lastRect=null;
+
+async function startCam(){
+  const s = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});
+  cam.srcObject=s; await cam.play();
+  capCv=document.createElement('canvas'); capCv.width=cam.videoWidth||1280; capCv.height=cam.videoHeight||720;
+  capCtx=capCv.getContext('2d',{willReadFrequently:true});
+}
+function lumAt(img, i){ return 0.2126*img[i]+0.7152*img[i+1]+0.0722*img[i+2]; }
+
+function findBlackRect(imgData, W, H){
+  // 与之前类似的投影法，快速鲁棒
+  const data=imgData.data;
+  const samples=512, vals=new Float32Array(samples);
+  for(let i=0;i<samples;i++){
+    const x=(i*37)%W, y=(i*61)%H, idx=(y*W+x)*4; vals[i]=lumAt(data, idx);
+  }
+  vals.sort(); const thr=Math.max(40, Math.min(140, vals[(samples*0.2)|0]-10));
+  const step=2, col=new Float32Array(W), row=new Float32Array(H);
+  for(let x=0;x<W;x++){ let dark=0,tot=0; for(let y=0;y<H;y+=step){ const i=(y*W+x)*4; if(lumAt(data,i)<thr) dark++; tot++; } col[x]=dark/Math.max(1,tot); }
+  for(let y=0;y<H;y++){ let dark=0,tot=0; for(let x=0;x<W;x+=step){ const i=(y*W+x)*4; if(lumAt(data,i)<thr) dark++; tot++; } row[y]=dark/Math.max(1,tot); }
+  function argmax(a,A,B){ let mi=A,mv=-1; for(let i=A;i<=B;i++){ if(a[i]>mv){mv=a[i];mi=i;} } return [mi,mv]; }
+  const [xL,sL]=argmax(col,0,(W*0.4)|0);
+  const [xR,sR]=argmax(col,(W*0.6)|0,W-1);
+  const [yT,sT]=argmax(row,0,(H*0.4)|0);
+  const [yB,sB]=argmax(row,(H*0.6)|0,H-1);
+  if(sL<0.15||sR<0.15||sT<0.15||sB<0.15) return null;
+  const sx=xL, sy=yT, sw=xR-xL+1, sh=yB-yT+1;
+  if(sw<80||sh<80) return null;
+  return {sx,sy,sw,sh};
+}
+
+function sameRect(a,b){ if(!a||!b) return false; const dx=Math.abs(a.sx-b.sx),dy=Math.abs(a.sy-b.sy),dw=Math.abs(a.sw-b.sw),dh=Math.abs(a.sh-b.sh); return dx<8&&dy<8&&dw<12&&dh<12; }
+
+function drawFreezeToView(rect){
+  // 把 ROI 映射到标准网格尺寸，平铺在 view 里并显示
+  const gridW = 2*MARGIN + Math.round((rect.sw-2*MARGIN)/CELLX)*CELLX;
+  const gridH = 2*MARGIN + K*CELLY;
+  view.width = gridW; view.height = gridH;
+  const vctx=view.getContext('2d'); vctx.imageSmoothingEnabled=false;
+  vctx.drawImage(capCv, rect.sx,rect.sy,rect.sw,rect.sh, 0,0, gridW,gridH);
+  cam.style.display='none'; view.style.display='block';
+  frame.className='frame lock';
+  hint.textContent="已锁定：按住=出声；左右滑=正/倒放/变调；松开=静音。双击空白处可重新取景。";
+}
+
+async function loop(){
+  if(!capCtx || locked) return;
+  const W=capCv.width, H=capCv.height;
+  capCtx.drawImage(cam,0,0,W,H);
+  const img=capCtx.getImageData(0,0,W,H);
+  const rect=findBlackRect(img,W,H);
+  if(rect && sameRect(rect,lastRect)){ stableCnt++; } else { stableCnt=0; }
+  lastRect=rect;
+  if(rect && stableCnt>18){ locked=true; drawFreezeToView(rect); return; }
+  requestAnimationFrame(loop);
+}
+
+document.addEventListener('dblclick', ()=>{ // 解锁回取景
+  if(!locked) return;
+  locked=false; stableCnt=0; lastRect=null;
+  view.style.display='none'; cam.style.display='block';
+  frame.className='frame breath'; hint.textContent="";
+  loop();
+});
+
+/* —— 频谱采样 → Griffin-Lim → 触摸唱针 —— */
 const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
+function sampleMFromCanvas(cv){
+  const ctx=cv.getContext('2d',{willReadFrequently:true});
+  const W=cv.width,H=cv.height, data=ctx.getImageData(0,0,W,H).data;
+  const T = Math.max(16, Math.round((W - 2*MARGIN)/CELLX));
+  const M=new Float32Array(K*T);
+  for(let t=0;t<T;t++){
+    for(let r=0;r<K;r++){
+      const cx=MARGIN + t*CELLX + (CELLX>>1);
+      const cy=MARGIN + (K-1-r)*CELLY + (CELLY>>1);
+      const idx=(cy*W+cx)*4;
+      const lum=0.2126*data[idx]+0.7152*data[idx+1]+0.0722*data[idx+2];
+      const norm=clamp(1 - lum/255, 0, 1);
+      const db = DBMIN + norm*(0-DBMIN);
+      M[t*K+r] = Math.pow(10, db/20);
+    }
+  }
+  return {M,T};
+}
+
+/* 小型 FFT/IFFT 与 Griffin-Lim */
 function hann(N){ const w=new Float32Array(N); for(let n=0;n<N;n++) w[n]=0.5*(1-Math.cos(2*Math.PI*n/(N-1))); return w; }
 const WIN=hann(NFFT);
-
-/* 简易 FFT */
 function makeFFT(N){
-  if(N&(N-1)) throw new Error("N must be power of two");
-  const cos=new Float32Array(N/2), sin=new Float32Array(N/2);
+  if(N&(N-1)) throw new Error('N must be pow2');
+  const cos=new Float32Array(N/2),sin=new Float32Array(N/2);
   for(let i=0;i<N/2;i++){ const a=-2*Math.PI*i/N; cos[i]=Math.cos(a); sin[i]=Math.sin(a); }
   const rev=new Uint32Array(N); let b=0; while((1<<b)<N) b++;
   for(let i=0;i<N;i++){ let x=i,y=0; for(let j=0;j<b;j++){ y=(y<<1)|(x&1); x>>=1; } rev[i]=y; }
   function fft(re,im){
     for(let i=0;i<N;i++){ const j=rev[i]; if(j>i){ let t=re[i]; re[i]=re[j]; re[j]=t; t=im[i]; im[i]=im[j]; im[j]=t; } }
-    for(let len=2; len<=N; len<<=1){
-      const h=len>>>1, step=N/len;
+    for(let len=2; len<=N; len<<=1){ const h=len>>>1, step=N/len;
       for(let i=0;i<N;i+=len) for(let k=0;k<h;k++){
         const c=cos[k*step], s=sin[k*step], j=i+k, l=j+h;
         const r=c*re[l]-s*im[l], ii=s*re[l]+c*im[l];
@@ -69,7 +147,6 @@ function makeFFT(N){
 }
 const FFT=makeFFT(NFFT);
 
-/* Griffin-Lim（异步） */
 async function griffinLimAsync(M, T, iter=8){
   const K=M.length/T, N=NFFT;
   const re=new Float32Array(N), im=new Float32Array(N);
@@ -98,175 +175,91 @@ async function griffinLimAsync(M, T, iter=8){
   return y;
 }
 
-/* 载入图片并在画布上处理 */
-const imgIn = document.getElementById('imgIn');
-const cap = document.getElementById('cap');
-const ctx = cap.getContext('2d',{willReadFrequently:true});
-const msg = document.getElementById('msg');
-let M_all=null, T_all=0, y_fast=null, y_full=null, pos=0;
-
-/* 识别黑框（假设近似正拍；轻度歪斜也能识别） */
-function findBlackRectOnCanvas(){
-  const W=cap.width, H=cap.height, img=ctx.getImageData(0,0,W,H).data;
-  // 投影计数（阈值取 20%分位）
-  const samples=512, vals=new Float32Array(samples);
-  for(let i=0;i<samples;i++){
-    const x=(i*37)%W, y=(i*61)%H, idx=(y*W+x)*4;
-    vals[i]=0.2126*img[idx]+0.7152*img[idx+1]+0.0722*img[idx+2];
-  }
-  vals.sort(); const thr=Math.max(40, Math.min(140, vals[Math.floor(samples*0.2)]-10));
-  const step=2, col=new Float32Array(W), row=new Float32Array(H);
-  for(let x=0;x<W;x++){ let dark=0,tot=0; for(let y=0;y<H;y+=step){ const i=(y*W+x)*4; const lum=0.2126*img[i]+0.7152*img[i+1]+0.0722*img[i+2]; if(lum<thr) dark++; tot++; } col[x]=dark/Math.max(1,tot); }
-  for(let y=0;y<H;y++){ let dark=0,tot=0; for(let x=0;x<W;x+=step){ const i=(y*W+x)*4; const lum=0.2126*img[i]+0.7152*img[i+1]+0.0722*img[i+2]; if(lum<thr) dark++; tot++; } row[y]=dark/Math.max(1,tot); }
-  function argmax(a,A,B){ let mi=A,mv=-1; for(let i=A;i<=B;i++){ if(a[i]>mv){mv=a[i];mi=i;} } return [mi,mv]; }
-  const [xL,sL]=argmax(col,0,Math.floor(W*0.4));
-  const [xR,sR]=argmax(col,Math.floor(W*0.6),W-1);
-  const [yT,sT]=argmax(row,0,Math.floor(H*0.4));
-  const [yB,sB]=argmax(row,Math.floor(H*0.6),H-1);
-  if(sL<0.15||sR<0.15||sT<0.15||sB<0.15) throw new Error('未找到稳定黑框');
-  if(!(xL<xR && yT<yB)) throw new Error('黑框顺序异常');
-  const sw=xR-xL+1, sh=yB-yT+1;
-  if(sw<40||sh<40) throw new Error('黑框过小');
-  return {sx:xL, sy:yT, sw, sh};
-}
-
-/* 提取 M(K×T) */
-function sampleMFromRect(rect){
-  const {sx,sy,sw,sh}=rect;
-  const T = Math.max(16, Math.round((sw - 2*MARGIN)/CELLX));
-  const gridW=2*MARGIN + T*CELLX, gridH=2*MARGIN + K*CELLY;
-  const tmp=document.createElement('canvas'); tmp.width=gridW; tmp.height=gridH;
-  const tctx=tmp.getContext('2d',{willReadFrequently:true});
-  tctx.imageSmoothingEnabled=false;
-  tctx.drawImage(cap, sx,sy,sw,sh, 0,0, gridW,gridH);
-  const img=tctx.getImageData(0,0,gridW,gridH), data=img.data;
-
-  // 环校验（四边缘为黑）
-  let dark=0, tot=0;
-  function ringRow(y){ for(let x=0;x<gridW;x+=2){ const i=(y*gridW+x)*4; const lum=0.2126*data[i]+0.7152*data[i+1]+0.0722*data[i+2]; if(lum<90) dark++; tot++; } }
-  function ringCol(x){ for(let y=0;y<gridH;y+=2){ const i=(y*gridW+x)*4; const lum=0.2126*data[i]+0.7152*data[i+1]+0.0722*data[i+2]; if(lum<90) dark++; tot++; } }
-  ringRow(2); ringRow(gridH-3); ringCol(2); ringCol(gridW-3);
-  if(dark/Math.max(1,tot) < 0.05) throw new Error('黑框环不完整');
-
-  const M=new Float32Array(K*T);
-  for(let t=0;t<T;t++){
-    for(let r=0;r<K;r++){
-      const cx=MARGIN + t*CELLX + (CELLX>>1);
-      const cy=MARGIN + (K-1-r)*CELLY + (CELLY>>1);
-      const idx=(cy*gridW + cx)*4;
-      const R=data[idx], G=data[idx+1], B=data[idx+2];
-      const lum = 0.2126*R + 0.7152*G + 0.0722*B;
-      const norm = clamp(1 - lum/255, 0, 1);
-      const db = DBMIN + norm*(0 - DBMIN);
-      M[t*K + r] = Math.pow(10, db/20);
-    }
-  }
-  return {M,T};
-}
-
-/* 音频（Worklet 优先 / ScriptProcessor 兜底）；按下=needle down 才出声 */
+/* 音频输出：按下=落针出声；移动=变速/方向；松开=静音 */
 const audio = {
-  ctx:null, node:null, unlocked:false, workletReady:false, mode:'none',
+  ctx:null, node:null, mode:'worklet',
   async ensure(){
     if(this.ctx) return;
     this.ctx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
     try{
       const code = `
         class ScrubPlayer extends AudioWorkletProcessor{
-          constructor(){ super(); this.buf=null; this.N=0; this.pos=0; this.posTarget=0; this.gain=0.9; this.down=false;
-            this.port.onmessage=e=>this.onmsg(e.data); }
-          onmsg(m){
-            if(m.type==='init'){ this.buf=m.buf; this.N=this.buf.length; this.pos=m.start||0; this.posTarget=this.pos; }
-            else if(m.type==='needle'){ this.down=!!m.down; }
-            else if(m.type==='setPos'){ this.posTarget=Math.max(0, Math.min(this.N-1, m.pos)); }
-          }
-          process(_,outs){
-            const out=outs[0][0];
-            if(!this.buf || !this.down){ out.fill(0); return true; }
-            const d=(this.posTarget - this.pos)/out.length;
-            let p=this.pos;
-            for(let n=0;n<out.length;n++){
-              p += d;
-              const i0=p|0, i1=Math.min(this.N-1,i0+1), a=p-i0;
-              const s=this.buf[i0]*(1-a)+this.buf[i1]*a;
-              out[n]=Math.tanh(s*0.9);
-            }
-            this.pos=p; return true;
-          }
+          constructor(){ super(); this.buf=null; this.N=0; this.pos=0; this.target=0; this.down=false;
+            this.port.onmessage=e=>{const m=e.data;if(m.t==='init'){this.buf=m.buf;this.N=this.buf.length;this.pos=this.target=m.start||0;}
+              else if(m.t==='pos'){this.target=Math.max(0,Math.min(this.N-1,m.p));}
+              else if(m.t==='needle'){this.down=!!m.d;}}}
+          process(_,outs){ const out=outs[0][0]; if(!this.buf || !this.down){out.fill(0); return true;}
+            const d=(this.target-this.pos)/out.length; let p=this.pos;
+            for(let n=0;n<out.length;n++){ p+=d; const i0=p|0,i1=Math.min(this.N-1,i0+1),a=p-i0; const s=this.buf[i0]*(1-a)+this.buf[i1]*a; out[n]=Math.tanh(s*0.9); }
+            this.pos=p; return true; }
         }
-        registerProcessor('scrub-player', ScrubPlayer);
+        registerProcessor('scrub-player',ScrubPlayer);
       `;
       const blob=new Blob([code],{type:'application/javascript'});
       const url=URL.createObjectURL(blob);
       await this.ctx.audioWorklet.addModule(url);
       URL.revokeObjectURL(url);
-      this.workletReady=true; this.mode='worklet';
-    }catch(e){ this.workletReady=false; this.mode='script'; }
-  },
-  async unlock(){
-    await this.ensure();
-    try{
-      const silent=this.ctx.createBuffer(1,1,SR);
-      const s=this.ctx.createBufferSource(); s.buffer=silent; s.connect(this.ctx.destination); s.start();
-      await this.ctx.resume();
-      this.unlocked = (this.ctx.state==='running');
-    }catch(_){}
-  },
-  async start(buf, startPos){
-    await this.ensure();
-    if(this.mode==='worklet'){
       this.node = new AudioWorkletNode(this.ctx,'scrub-player',{numberOfInputs:0,numberOfOutputs:1,outputChannelCount:[1]});
       this.node.connect(this.ctx.destination);
-      this.node.port.postMessage({type:'init', buf, start:startPos});
-    }else{
-      const sp = this.ctx.createScriptProcessor(1024,0,1);
-      let pos=startPos, target=startPos, N=buf.length, down=false;
-      sp.onaudioprocess = (e)=>{
+    }catch(e){
+      this.mode='script';
+      const sp=this.ctx.createScriptProcessor(1024,0,1);
+      let pos=0,target=0,buf=null,N=0,down=false;
+      sp.onaudioprocess=(e)=>{
         const out=e.outputBuffer.getChannelData(0);
-        if(!down){ out.fill(0); return; }
-        const d=(target - pos)/out.length;
-        for(let n=0;n<out.length;n++){
-          pos += d;
-          const i0=pos|0, i1=Math.min(N-1,i0+1), a=pos-i0;
-          out[n] = Math.tanh((buf[i0]*(1-a)+buf[i1]*a)*0.9);
-        }
+        if(!buf||!down){ out.fill(0); return; }
+        const d=(target-pos)/out.length;
+        for(let n=0;n<out.length;n++){ pos+=d; const i0=pos|0,i1=Math.min(N-1,i0+1),a=pos-i0; out[n]=Math.tanh((buf[i0]*(1-a)+buf[i1]*a)*0.9); }
       };
-      sp.setPos = (p)=>{ target=p; };
-      sp.setNeedle = (b)=>{ down=b; };
+      sp.init=(b,start)=>{buf=b;N=b.length;pos=target=start||0;};
+      sp.setPos=(p)=>{target=Math.max(0,Math.min(N-1,p));};
+      sp.setNeedle=(d)=>{down=!!d;};
       sp.connect(this.ctx.destination);
-      this.node = sp;
+      this.node=sp;
     }
   },
-  setPos(p){
-    if(!this.node) return;
-    if(this.mode==='worklet') this.node.port.postMessage({type:'setPos', pos:p});
-    else if(this.node.setPos) this.node.setPos(p);
+  async start(buf,startPos){
+    await this.ensure();
+    if(this.mode==='worklet'){ this.node.port.postMessage({t:'init',buf,start:startPos}); }
+    else this.node.init(buf,startPos);
   },
-  setNeedle(d){ if(!this.node) return; if(this.mode==='worklet') this.node.port.postMessage({type:'needle', down:d}); else if(this.node.setNeedle) this.node.setNeedle(d); }
+  setPos(p){ if(!this.node) return; if(this.mode==='worklet') this.node.port.postMessage({t:'pos',p}); else this.node.setPos(p); },
+  setNeedle(d){ if(!this.node) return; if(this.mode==='worklet') this.node.port.postMessage({t:'needle',d}); else this.node.setNeedle(d); }
 };
 
-/* 交互：按下=落针；移动=改变位置；松开=静音 */
+let ybuf=null, T_all=0;
+async function prepareAudio(){
+  const {M,T}=sampleMFromCanvas(view);
+  T_all=T;
+  // 先快速 2 轮预览
+  ybuf = await griffinLimAsync(M,T,2);
+  await audio.start(ybuf, 0);
+  // 背景再跑高质
+  (async()=>{ try{ const y = await griffinLimAsync(M,T,10); ybuf = y; }catch(_){}})();
+}
+
+/* 交互（手指=唱针） */
 let touching=false;
 function screenXToPos(x){
-  if(!T_all) return 0;
+  if(!T_all||!ybuf) return 0;
   const total = (T_all*HOP + NFFT);
-  const ratio = clamp(x / innerWidth, 0, 1);
-  return Math.floor(ratio*(total-1));
+  const ratio = Math.max(0, Math.min(1, x / innerWidth));
+  return (ratio*(total-1))|0;
 }
 function onDown(e){
-  if(!y_fast && !y_full) return;
+  if(!ybuf) return;
   touching=true;
+  if(audio.ctx?.state!=='running') audio.ctx.resume();
   const x = (e.touches? e.touches[0].clientX : e.clientX);
-  const p = screenXToPos(x);
-  audio.setPos(p);
-  audio.setNeedle(true);
+  audio.setPos(screenXToPos(x)); audio.setNeedle(true);
 }
 function onMove(e){
-  if(!touching) return;
+  if(!touching||!ybuf) return;
   const x = (e.touches? e.touches[0].clientX : e.clientX);
   audio.setPos(screenXToPos(x));
 }
 function onUp(){ touching=false; audio.setNeedle(false); }
+
 document.addEventListener('pointerdown', onDown, {passive:true});
 document.addEventListener('pointermove', onMove, {passive:true});
 document.addEventListener('pointerup', onUp, {passive:true});
@@ -274,54 +267,21 @@ document.addEventListener('touchstart', onDown, {passive:true});
 document.addEventListener('touchmove', onMove, {passive:true});
 document.addEventListener('touchend', onUp, {passive:true});
 
-/* 加载图片 → 识别 → 重建 */
-imgIn.onchange = async ()=>{
-  const f = imgIn.files?.[0]; if(!f) return;
-  const url = URL.createObjectURL(f);
-  const img = new Image();
-  img.onload = async ()=>{
-    cap.width = img.naturalWidth; cap.height = img.naturalHeight;
-    ctx.drawImage(img,0,0);
-    URL.revokeObjectURL(url);
-    try{
-      msg.textContent="识别黑框…";
-      const rect = findBlackRectOnCanvas();
-      // 取 ROI 到标准网格尺寸再采样
-      const tmp=document.createElement('canvas');
-      const T = Math.max(16, Math.round((rect.sw - 2*MARGIN)/CELLX));
-      const gridW=2*MARGIN + T*CELLX, gridH=2*MARGIN + K*CELLY;
-      tmp.width=gridW; tmp.height=gridH;
-      tmp.getContext('2d',{willReadFrequently:true}).drawImage(cap, rect.sx,rect.sy,rect.sw,rect.sh, 0,0, gridW,gridH);
-      cap.width=gridW; cap.height=gridH; ctx.drawImage(tmp,0,0);
+/* 启动流程 */
+(async ()=>{
+  try{
+    await startCam();
+    loop();
+  }catch(e){
+    document.getElementById('tip').textContent="相机启动失败：需要在 HTTPS（如 GitHub Pages）下访问，并允许相机权限。";
+  }
+})();
 
-      msg.textContent="提取频谱…";
-      const {M,T:Tgot} = sampleMFromRect({sx:0,sy:0,sw:gridW,sh:gridH});
-      M_all = M; T_all = Tgot;
-
-      msg.textContent="重建声音（预览）…";
-      await audio.unlock();
-      y_fast = await griffinLimAsync(M_all, T_all, 2);
-      pos = Math.floor((T_all*HOP + NFFT/2));
-      await audio.start(y_fast, pos);
-
-      (async ()=>{
-        try{
-          const y = await griffinLimAsync(M_all, T_all, 10);
-          y_full = y; // 若需切换更高质，可在此直接替换 node 内部缓冲（本实现边滑边用 setPos 不区分 fast/full）
-        }catch(_){}
-      })();
-
-      msg.textContent="就绪：按住屏幕出声，左右滑动=正/倒放/变调";
-      document.getElementById('hint').textContent="贴士：尽量正对拍摄；若黑框识别失败，请再拍一张更平正/更清晰的照片";
-    }catch(e){
-      console.error(e);
-      msg.textContent="失败："+e.message;
-      alert("识别失败："+e.message+"。建议：更平直地拍一张，光线均匀、避免反光。");
-    }
-  };
-  img.onerror = ()=>{ URL.revokeObjectURL(url); alert("无法读取图片"); };
-  img.src = url;
-};
+/* 锁定后准备音频 */
+const obs=new MutationObserver(()=>{
+  if(view.style.display==='block' && !ybuf){ prepareAudio(); }
+});
+obs.observe(view,{attributes:true,attributeFilter:['style']});
 </script>
 </body>
 </html>
