@@ -716,135 +716,138 @@
         }
 
         function synthesizeAudio(magnitudes) {
-            const fftSize = 1024; // 使用与编码器相同的FFT大小
-            const bufferLength = fftSize;
+            const bufferLength = 1024;
             const buffer = audioContext.createBuffer(1, bufferLength, SAMPLE_RATE);
             const channelData = buffer.getChannelData(0);
 
-            // 使用IFFT重建音频
-            const complexSpectrum = new Float32Array(fftSize * 2);
+            // 找到主要的频率峰值
+            const peaks = findSpectralPeaks(magnitudes);
 
-            // 构建复数频谱
-            for (let i = 0; i < magnitudes.length && i < fftSize / 2 + 1; i++) {
-                const magnitude = magnitudes[i];
-
-                // 使用随机相位（更自然的声音）
-                const phase = Math.random() * 2 * Math.PI;
-
-                // 实部和虚部
-                complexSpectrum[i * 2] = magnitude * Math.cos(phase);
-                complexSpectrum[i * 2 + 1] = magnitude * Math.sin(phase);
+            if (peaks.length === 0) {
+                // 如果没有找到峰值，返回静音
+                return buffer;
             }
 
-            // 镜像对称（实信号的要求）
-            for (let i = 1; i < fftSize / 2; i++) {
-                const srcIdx = i * 2;
-                const dstIdx = (fftSize - i) * 2;
-                complexSpectrum[dstIdx] = complexSpectrum[srcIdx];
-                complexSpectrum[dstIdx + 1] = -complexSpectrum[srcIdx + 1];
-            }
-
-            // 执行IFFT
-            const timeSignal = ifft(complexSpectrum, fftSize);
-
-            // 应用窗函数和归一化
-            const window = hanningWindow(fftSize);
-            let maxVal = 1e-10;
-
+            // 猫叫声特征合成
             for (let i = 0; i < bufferLength; i++) {
-                timeSignal[i] *= window[i];
-                maxVal = Math.max(maxVal, Math.abs(timeSignal[i]));
-            }
+                let sample = 0;
+                const t = i / SAMPLE_RATE;
 
-            // 归一化并复制到音频缓冲区
-            const gain = 0.3 / maxVal; // 控制音量
-            for (let i = 0; i < bufferLength; i++) {
-                channelData[i] = Math.tanh(timeSignal[i] * gain);
+                // 为每个峰值生成音调
+                for (let p = 0; p < peaks.length; p++) {
+                    const peak = peaks[p];
+                    const frequency = peak.frequency;
+                    const amplitude = peak.magnitude;
+
+                    // 基础正弦波
+                    const phase = 2 * Math.PI * frequency * t;
+                    let tone = Math.sin(phase);
+
+                    // 添加轻微的锯齿波特征（猫叫声的粗糙感）
+                    const sawPhase = (frequency * t) % 1;
+                    tone += (sawPhase - 0.5) * 0.2;
+
+                    // 频率调制（颤音效果）
+                    const vibrato = 1 + 0.05 * Math.sin(2 * Math.PI * 6 * t);
+                    tone = Math.sin(2 * Math.PI * frequency * vibrato * t);
+
+                    // 幅度包络（让声音更自然）
+                    const envelope = Math.exp(-t * 2) * (1 + 0.3 * Math.sin(2 * Math.PI * 8 * t));
+
+                    sample += amplitude * tone * envelope * 0.4;
+                }
+
+                // 添加高频噪声（猫叫声的嘶嘶声）
+                const noiseLevel = getNoiseLevel(magnitudes);
+                if (noiseLevel > 0.03) {
+                    // 高通滤波的噪声
+                    const noise = (Math.random() - 0.5) * 2;
+                    const filteredNoise = noise - (noise * 0.8); // 简单高通
+                    sample += filteredNoise * noiseLevel * 0.15;
+                }
+
+                // 动态范围压缩和软限幅
+                sample = Math.tanh(sample * 1.2) * 0.7;
+                channelData[i] = sample;
             }
 
             return buffer;
         }
 
-        // Hanning窗函数
-        function hanningWindow(size) {
-            const window = new Float32Array(size);
-            for (let i = 0; i < size; i++) {
-                window[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (size - 1)));
-            }
-            return window;
-        }
+        // 找到频谱中的主要峰值 - 针对猫叫声优化
+        function findSpectralPeaks(magnitudes) {
+            const peaks = [];
+            const minPeakHeight = 0.08; // 降低阈值以捕获更多细节
+            const minPeakDistance = 2; // 减少最小距离
 
-        // 简化的IFFT实现
-        function ifft(complexData, N) {
-            // 复制数据
-            const data = new Float32Array(complexData);
-
-            // 共轭
-            for (let i = 1; i < N * 2; i += 2) {
-                data[i] = -data[i];
-            }
-
-            // 执行FFT
-            fft(data, N);
-
-            // 归一化并共轭
-            const result = new Float32Array(N);
-            for (let i = 0; i < N; i++) {
-                result[i] = data[i * 2] / N; // 只取实部
-            }
-
-            return result;
-        }
-
-        // FFT实现（Cooley-Tukey算法）
-        function fft(data, N) {
-            // 位反转
-            const j = new Array(N);
-            j[0] = 0;
-            for (let i = 1; i < N; i++) {
-                j[i] = j[i >> 1] >> 1;
-                if (i & 1) j[i] |= N >> 1;
-            }
-
-            for (let i = 0; i < N; i++) {
-                if (i < j[i]) {
-                    // 交换复数
-                    let temp = data[i * 2];
-                    data[i * 2] = data[j[i] * 2];
-                    data[j[i] * 2] = temp;
-
-                    temp = data[i * 2 + 1];
-                    data[i * 2 + 1] = data[j[i] * 2 + 1];
-                    data[j[i] * 2 + 1] = temp;
+            // 先进行轻微平滑以减少噪声峰值
+            const smoothed = new Float32Array(magnitudes.length);
+            for (let i = 0; i < magnitudes.length; i++) {
+                let sum = 0, count = 0;
+                for (let j = Math.max(0, i - 1); j <= Math.min(magnitudes.length - 1, i + 1); j++) {
+                    sum += magnitudes[j];
+                    count++;
                 }
+                smoothed[i] = sum / count;
             }
 
-            // Cooley-Tukey FFT
-            for (let len = 2; len <= N; len <<= 1) {
-                const halfLen = len >> 1;
-                const step = N / len;
+            for (let i = 2; i < smoothed.length - 2; i++) {
+                const current = smoothed[i];
+                const prev = smoothed[i - 1];
+                const next = smoothed[i + 1];
 
-                for (let i = 0; i < N; i += len) {
-                    for (let k = 0; k < halfLen; k++) {
-                        const angle = -2 * Math.PI * k * step / N;
-                        const wReal = Math.cos(angle);
-                        const wImag = Math.sin(angle);
+                // 更严格的峰值检测
+                if (current > prev && current > next &&
+                    current > smoothed[i - 2] && current > smoothed[i + 2] &&
+                    current > minPeakHeight) {
 
-                        const u = i + k;
-                        const v = i + k + halfLen;
+                    // 检查与已有峰值的距离
+                    let tooClose = false;
+                    for (const existingPeak of peaks) {
+                        if (Math.abs(i - existingPeak.index) < minPeakDistance) {
+                            if (current > existingPeak.magnitude) {
+                                // 如果新峰值更强，替换旧的
+                                peaks.splice(peaks.indexOf(existingPeak), 1);
+                            } else {
+                                tooClose = true;
+                            }
+                            break;
+                        }
+                    }
 
-                        const tReal = data[v * 2] * wReal - data[v * 2 + 1] * wImag;
-                        const tImag = data[v * 2] * wImag + data[v * 2 + 1] * wReal;
-
-                        data[v * 2] = data[u * 2] - tReal;
-                        data[v * 2 + 1] = data[u * 2 + 1] - tImag;
-
-                        data[u * 2] += tReal;
-                        data[u * 2 + 1] += tImag;
+                    if (!tooClose) {
+                        const frequency = (i / magnitudes.length) * (SAMPLE_RATE / 2);
+                        // 猫叫声主要在200Hz-3000Hz范围内
+                        if (frequency >= 100 && frequency <= 4000) {
+                            peaks.push({
+                                index: i,
+                                magnitude: current,
+                                frequency: frequency
+                            });
+                        }
                     }
                 }
             }
+
+            // 按幅度排序，取前12个最强的峰值
+            peaks.sort((a, b) => b.magnitude - a.magnitude);
+            return peaks.slice(0, 12);
         }
+
+        // 估计噪声水平
+        function getNoiseLevel(magnitudes) {
+            // 计算高频区域的平均能量（通常是噪声）
+            let highFreqSum = 0;
+            const startIdx = Math.floor(magnitudes.length * 0.7); // 从70%频率开始
+
+            for (let i = startIdx; i < magnitudes.length; i++) {
+                highFreqSum += magnitudes[i];
+            }
+
+            return highFreqSum / (magnitudes.length - startIdx);
+        }
+
+
 
         function playAudioBuffer(buffer) {
             if (isPlaying) return;
