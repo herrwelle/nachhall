@@ -1,21 +1,29 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
-    <meta charset="utf-8"/>
-    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
     <title>频谱图播放器</title>
     <style>
-        :root { color-scheme: dark; }
-        * { box-sizing: border-box; }
-        html, body { 
-            margin: 0; 
-            height: 100%; 
-            background: #000; 
-            color: #fff; 
+        :root {
+            color-scheme: dark;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            margin: 0;
+            height: 100%;
+            background: #000;
+            color: #fff;
             font-family: system-ui, -apple-system, sans-serif;
             overflow: hidden;
         }
-        
+
         #stage {
             position: fixed;
             inset: 0;
@@ -23,44 +31,44 @@
             place-items: center;
             background: #000;
         }
-        
+
         video {
             max-width: 100vw;
             max-height: 100vh;
             display: block;
             opacity: 0.95;
         }
-        
+
         #overlay {
             position: fixed;
             left: 0;
             top: 0;
             width: 100vw;
             height: 100vh;
-            pointer-events: none;
+            pointer-events: auto;
             z-index: 10;
         }
-        
+
         #frame {
             position: fixed;
             inset: 0;
             pointer-events: none;
             transition: box-shadow 0.3s;
         }
-        
+
         .frame-searching {
-            box-shadow: 0 0 0 3px rgba(255,255,255,0.6) inset;
+            box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.6) inset;
         }
-        
+
         .frame-found {
-            box-shadow: 0 0 0 4px rgba(0,255,170,0.9) inset;
+            box-shadow: 0 0 0 4px rgba(0, 255, 170, 0.9) inset;
         }
-        
+
         #info {
             position: fixed;
             top: 20px;
             left: 20px;
-            background: rgba(0,0,0,0.8);
+            background: rgba(0, 0, 0, 0.8);
             padding: 15px;
             border-radius: 8px;
             font-size: 14px;
@@ -68,13 +76,13 @@
             line-height: 1.4;
             z-index: 20;
         }
-        
+
         #controls {
             position: fixed;
             bottom: 20px;
             left: 50%;
             transform: translateX(-50%);
-            background: rgba(0,0,0,0.8);
+            background: rgba(0, 0, 0, 0.8);
             padding: 15px;
             border-radius: 8px;
             display: flex;
@@ -82,7 +90,7 @@
             align-items: center;
             z-index: 20;
         }
-        
+
         .control-btn {
             background: #007AFF;
             color: white;
@@ -93,28 +101,28 @@
             cursor: pointer;
             transition: background 0.2s;
         }
-        
+
         .control-btn:hover {
             background: #0056CC;
         }
-        
+
         .control-btn:disabled {
             background: #666;
             cursor: not-allowed;
         }
-        
+
         #fingerTrail {
             position: fixed;
             width: 20px;
             height: 20px;
-            background: rgba(255,255,255,0.8);
+            background: rgba(255, 255, 255, 0.8);
             border-radius: 50%;
             pointer-events: none;
             z-index: 15;
             display: none;
-            box-shadow: 0 0 10px rgba(255,255,255,0.5);
+            box-shadow: 0 0 10px rgba(255, 255, 255, 0.5);
         }
-        
+
         .status-indicator {
             display: inline-block;
             width: 8px;
@@ -122,17 +130,28 @@
             border-radius: 50%;
             margin-right: 8px;
         }
-        
-        .status-searching { background: #ffa500; }
-        .status-found { background: #00ff00; }
-        .status-playing { background: #00aaff; }
-        .status-error { background: #ff4444; }
-        
+
+        .status-searching {
+            background: #ffa500;
+        }
+
+        .status-found {
+            background: #00ff00;
+        }
+
+        .status-playing {
+            background: #00aaff;
+        }
+
+        .status-error {
+            background: #ff4444;
+        }
+
         #debug {
             position: fixed;
             bottom: 20px;
             right: 20px;
-            background: rgba(0,0,0,0.8);
+            background: rgba(0, 0, 0, 0.8);
             padding: 10px;
             border-radius: 6px;
             font-family: monospace;
@@ -143,28 +162,29 @@
         }
     </style>
 </head>
+
 <body>
     <div id="stage">
         <video id="camera" playsinline autoplay muted></video>
     </div>
-    
+
     <canvas id="overlay"></canvas>
     <div id="frame" class="frame-searching"></div>
     <div id="fingerTrail"></div>
-    
+
     <div id="info">
         <div><span class="status-indicator status-searching"></span>正在搜索频谱图...</div>
         <div style="margin-top: 10px; font-size: 12px; opacity: 0.8;">
             将相机对准频谱图，用手指从左到右滑动播放声音
         </div>
     </div>
-    
+
     <div id="controls">
         <button class="control-btn" id="toggleCamera">切换摄像头</button>
         <button class="control-btn" id="calibrate">重新校准</button>
         <button class="control-btn" id="toggleDebug">调试信息</button>
     </div>
-    
+
     <div id="debug" style="display: none;">
         <div>FPS: <span id="fps">0</span></div>
         <div>检测: <span id="detection">无</span></div>
@@ -179,24 +199,24 @@
         let ctx = null;
         let captureCanvas = null;
         let captureCtx = null;
-        
+
         let audioContext = null;
         let isPlaying = false;
         let spectrogramRect = null;
         let spectrogramData = null;
-        
+
         let fingerPosition = null;
         let lastFingerTime = 0;
-        
+
         let frameCount = 0;
         let lastFpsTime = 0;
-        
+
         // 音频参数（与编码器一致）
         const SAMPLE_RATE = 16000;
         const NFFT = 1024;
         const HOP_LENGTH = 512;
         const MAX_DURATION = 16;
-        
+
         // DOM元素
         const cameraElement = document.getElementById('camera');
         const overlay = document.getElementById('overlay');
@@ -204,7 +224,7 @@
         const info = document.getElementById('info');
         const fingerTrail = document.getElementById('fingerTrail');
         const debugPanel = document.getElementById('debug');
-        
+
         // 初始化
         async function init() {
             try {
@@ -218,7 +238,7 @@
                 updateInfo('相机启动失败，请允许相机权限并刷新页面', 'error');
             }
         }
-        
+
         async function startCamera() {
             const constraints = {
                 video: {
@@ -227,53 +247,53 @@
                     height: { ideal: 720 }
                 }
             };
-            
+
             const stream = await navigator.mediaDevices.getUserMedia(constraints);
             cameraElement.srcObject = stream;
             await cameraElement.play();
-            
+
             camera = cameraElement;
         }
-        
+
         function setupCanvas() {
             canvas = overlay;
             ctx = canvas.getContext('2d');
-            
+
             // 创建捕获画布
             captureCanvas = document.createElement('canvas');
             captureCtx = captureCanvas.getContext('2d', { willReadFrequently: true });
-            
+
             resizeCanvas();
             window.addEventListener('resize', resizeCanvas);
         }
-        
+
         function resizeCanvas() {
             canvas.width = window.innerWidth;
             canvas.height = window.innerHeight;
-            
+
             if (camera) {
                 captureCanvas.width = camera.videoWidth || 1280;
                 captureCanvas.height = camera.videoHeight || 720;
             }
         }
-        
+
         function setupEventListeners() {
             // 触摸事件
             canvas.addEventListener('touchstart', handleTouchStart, { passive: false });
             canvas.addEventListener('touchmove', handleTouchMove, { passive: false });
             canvas.addEventListener('touchend', handleTouchEnd, { passive: false });
-            
+
             // 鼠标事件（用于桌面测试）
             canvas.addEventListener('mousedown', handleMouseDown);
             canvas.addEventListener('mousemove', handleMouseMove);
             canvas.addEventListener('mouseup', handleMouseUp);
-            
+
             // 控制按钮
             document.getElementById('toggleCamera').addEventListener('click', toggleCamera);
             document.getElementById('calibrate').addEventListener('click', recalibrate);
             document.getElementById('toggleDebug').addEventListener('click', toggleDebug);
         }
-        
+
         function updateInfo(message, status) {
             const statusClass = `status-${status}`;
             info.innerHTML = `
@@ -282,23 +302,23 @@
                     将相机对准频谱图，用手指从左到右滑动播放声音
                 </div>
             `;
-            
+
             frame.className = status === 'found' ? 'frame-found' : 'frame-searching';
         }
-        
+
         function updateDebug(detection, finger, audio) {
             if (debugPanel.style.display === 'none') return;
-            
+
             document.getElementById('detection').textContent = detection || '无';
             document.getElementById('finger').textContent = finger || '无';
             document.getElementById('audio').textContent = audio || '未初始化';
         }
-        
+
         // 主循环
         function startMainLoop() {
             function loop() {
                 frameCount++;
-                
+
                 // 更新FPS
                 const now = performance.now();
                 if (now - lastFpsTime > 1000) {
@@ -308,31 +328,31 @@
                     frameCount = 0;
                     lastFpsTime = now;
                 }
-                
+
                 // 处理视频帧
                 if (camera && camera.readyState === camera.HAVE_ENOUGH_DATA) {
                     processFrame();
                 }
-                
+
                 requestAnimationFrame(loop);
             }
             loop();
         }
-        
+
         function processFrame() {
             // 捕获当前帧
             captureCtx.drawImage(camera, 0, 0, captureCanvas.width, captureCanvas.height);
             const imageData = captureCtx.getImageData(0, 0, captureCanvas.width, captureCanvas.height);
-            
+
             // 检测频谱图
             const detectedRect = detectSpectrogram(imageData);
-            
+
             if (detectedRect) {
                 if (!spectrogramRect || rectChanged(spectrogramRect, detectedRect)) {
                     spectrogramRect = detectedRect;
                     spectrogramData = extractSpectrogramData(imageData, detectedRect);
                     updateInfo('频谱图检测成功，请用手指滑动播放', 'found');
-                    updateDebug(`${detectedRect.width}x${detectedRect.height}`, fingerPosition ? '检测中' : '无', audioContext ? '就绪' : '未初始化');
+                    updateDebug(`${detectedRect.width}x${detectedRect.height}`, fingerPosition ? `${fingerPosition.x.toFixed(0)},${fingerPosition.y.toFixed(0)}` : '无', audioContext ? '就绪' : '未初始化');
                 }
             } else {
                 if (spectrogramRect) {
@@ -342,105 +362,113 @@
                     updateDebug('无', '无', audioContext ? '就绪' : '未初始化');
                 }
             }
-            
+
+            // 更新调试信息（包括手指位置）
+            if (frameCount % 10 === 0) { // 每10帧更新一次，避免过于频繁
+                const fingerInfo = fingerPosition ? `${fingerPosition.x.toFixed(0)},${fingerPosition.y.toFixed(0)}` : '无';
+                const detectionInfo = spectrogramRect ? `${spectrogramRect.width}x${spectrogramRect.height}` : '无';
+                const audioInfo = audioContext ? (audioContext.state === 'running' ? '就绪' : audioContext.state) : '未初始化';
+                updateDebug(detectionInfo, fingerInfo, audioInfo);
+            }
+
             // 绘制覆盖层
             drawOverlay();
-        }    
-    // 频谱图检测
+        }
+        // 频谱图检测
         function detectSpectrogram(imageData) {
             const { data, width, height } = imageData;
-            
+
             // 寻找四个角的定位标记（黑色方块）
             const markers = findCornerMarkers(data, width, height);
-            
+
             if (markers.length >= 3) {
                 // 根据标记计算频谱图区域
                 return calculateSpectrogramRect(markers, width, height);
             }
-            
+
             return null;
         }
-        
+
         function findCornerMarkers(data, width, height) {
             const markers = [];
             const threshold = 80; // 黑色阈值
             const minMarkerSize = 10;
             const maxMarkerSize = 50;
-            
+
             // 分区域搜索四个角
             const regions = [
-                { x: 0, y: 0, w: width/3, h: height/3 }, // 左上
-                { x: width*2/3, y: 0, w: width/3, h: height/3 }, // 右上
-                { x: 0, y: height*2/3, w: width/3, h: height/3 }, // 左下
-                { x: width*2/3, y: height*2/3, w: width/3, h: height/3 } // 右下
+                { x: 0, y: 0, w: width / 3, h: height / 3 }, // 左上
+                { x: width * 2 / 3, y: 0, w: width / 3, h: height / 3 }, // 右上
+                { x: 0, y: height * 2 / 3, w: width / 3, h: height / 3 }, // 左下
+                { x: width * 2 / 3, y: height * 2 / 3, w: width / 3, h: height / 3 } // 右下
             ];
-            
+
             for (const region of regions) {
                 const marker = findMarkerInRegion(data, width, height, region, threshold, minMarkerSize, maxMarkerSize);
                 if (marker) {
                     markers.push(marker);
                 }
             }
-            
+
             return markers;
         }
-        
+
         function findMarkerInRegion(data, width, height, region, threshold, minSize, maxSize) {
             const { x: rx, y: ry, w: rw, h: rh } = region;
-            
+
             for (let y = ry; y < ry + rh - minSize; y += 3) {
                 for (let x = rx; x < rx + rw - minSize; x += 3) {
                     // 检查是否是黑色区域的开始
                     if (getPixelBrightness(data, x, y, width) < threshold) {
                         const markerSize = measureMarkerSize(data, width, height, x, y, threshold, maxSize);
                         if (markerSize >= minSize && markerSize <= maxSize) {
-                            return { x: x + markerSize/2, y: y + markerSize/2, size: markerSize };
+                            return { x: x + markerSize / 2, y: y + markerSize / 2, size: markerSize };
                         }
                     }
                 }
             }
-            
+
             return null;
         }
-        
+
         function getPixelBrightness(data, x, y, width) {
             const index = (y * width + x) * 4;
             return (data[index] + data[index + 1] + data[index + 2]) / 3;
         }
-        
+
         function measureMarkerSize(data, width, height, startX, startY, threshold, maxSize) {
             let size = 0;
-            
+
             // 向右下方测量正方形大小
             for (let s = 1; s <= maxSize; s++) {
                 const x = startX + s;
                 const y = startY + s;
-                
+
                 if (x >= width || y >= height) break;
-                
+
                 if (getPixelBrightness(data, x, y, width) >= threshold) {
                     break;
                 }
-                
+
                 size = s;
             }
-            
+
             return size;
         }
-        
+
         function calculateSpectrogramRect(markers, width, height) {
             if (markers.length < 3) return null;
-            
+
             // 找到边界
             let minX = width, maxX = 0, minY = height, maxY = 0;
-            
+
             for (const marker of markers) {
                 minX = Math.min(minX, marker.x);
                 maxX = Math.max(maxX, marker.x);
                 minY = Math.min(minY, marker.y);
                 maxY = Math.max(maxY, marker.y);
             }
-            
+
             // 估算频谱图区域（标记之间的区域）
             const margin = 20; // 标记到频谱图的距离
             return {
@@ -450,33 +478,33 @@
                 height: maxY - minY - 2 * margin
             };
         }
-        
+
         function rectChanged(oldRect, newRect) {
             if (!oldRect || !newRect) return true;
-            
+
             const threshold = 20;
             return Math.abs(oldRect.x - newRect.x) > threshold ||
-                   Math.abs(oldRect.y - newRect.y) > threshold ||
-                   Math.abs(oldRect.width - newRect.width) > threshold ||
-                   Math.abs(oldRect.height - newRect.height) > threshold;
+                Math.abs(oldRect.y - newRect.y) > threshold ||
+                Math.abs(oldRect.width - newRect.width) > threshold ||
+                Math.abs(oldRect.height - newRect.height) > threshold;
         }
-        
+
         // 提取频谱图数据
         function extractSpectrogramData(imageData, rect) {
             const { data, width } = imageData;
             const { x, y, width: rectWidth, height: rectHeight } = rect;
-            
+
             const spectData = [];
             const timeSteps = 100; // 时间分辨率
             const freqSteps = 50;  // 频率分辨率
-            
+
             for (let t = 0; t < timeSteps; t++) {
                 const frameData = [];
                 const pixelX = Math.floor(x + (t / timeSteps) * rectWidth);
-                
+
                 for (let f = 0; f < freqSteps; f++) {
                     const pixelY = Math.floor(y + rectHeight - (f / freqSteps) * rectHeight);
-                    
+
                     if (pixelX < width && pixelY >= 0) {
                         const brightness = getPixelBrightness(data, pixelX, pixelY, width);
                         // 转换为幅度（亮度越低，幅度越高）
@@ -486,22 +514,23 @@
                         frameData.push(0);
                     }
                 }
-                
+
                 spectData.push(frameData);
             }
-            
+
             return spectData;
         }
-        
+
         // 触摸和鼠标事件处理
         function handleTouchStart(e) {
             e.preventDefault();
+            console.log('触摸开始:', e.touches.length);
             if (e.touches.length > 0) {
                 const touch = e.touches[0];
                 startFingerTracking(touch.clientX, touch.clientY);
             }
         }
-        
+
         function handleTouchMove(e) {
             e.preventDefault();
             if (e.touches.length > 0) {
@@ -509,56 +538,61 @@
                 updateFingerPosition(touch.clientX, touch.clientY);
             }
         }
-        
+
         function handleTouchEnd(e) {
             e.preventDefault();
+            console.log('触摸结束');
             stopFingerTracking();
         }
-        
+
         function handleMouseDown(e) {
+            console.log('鼠标按下:', e.clientX, e.clientY);
             startFingerTracking(e.clientX, e.clientY);
         }
-        
+
         function handleMouseMove(e) {
             if (fingerPosition) {
                 updateFingerPosition(e.clientX, e.clientY);
             }
         }
-        
+
         function handleMouseUp(e) {
+            console.log('鼠标释放');
             stopFingerTracking();
         }
-        
-        function startFingerTracking(x, y) {
-            if (!spectrogramRect || !spectrogramData) return;
+
+        async function startFingerTracking(x, y) {
+            console.log('开始手指跟踪:', x, y);
             
             fingerPosition = { x, y };
             lastFingerTime = performance.now();
-            
+
             // 初始化音频上下文
             if (!audioContext) {
-                initAudioContext();
+                await initAudioContext();
             }
-            
+
             // 显示手指轨迹
             fingerTrail.style.display = 'block';
             fingerTrail.style.left = (x - 10) + 'px';
             fingerTrail.style.top = (y - 10) + 'px';
-            
+
             updateFingerPosition(x, y);
         }
-        
+
         function updateFingerPosition(x, y) {
-            if (!fingerPosition || !spectrogramRect || !spectrogramData) return;
-            
+            if (!fingerPosition) return;
+
             fingerPosition.x = x;
             fingerPosition.y = y;
             lastFingerTime = performance.now();
-            
+
             // 更新手指轨迹显示
             fingerTrail.style.left = (x - 10) + 'px';
             fingerTrail.style.top = (y - 10) + 'px';
             
+            console.log('手指位置更新:', x, y);
+
             // 计算在频谱图中的位置
             const spectPosition = screenToSpectrogramCoords(x, y);
             if (spectPosition) {
@@ -570,7 +604,7 @@
                 );
             }
         }
-        
+
         function stopFingerTracking() {
             fingerPosition = null;
             fingerTrail.style.display = 'none';
@@ -581,155 +615,194 @@
                 audioContext ? '就绪' : '未初始化'
             );
         }
-        
+
         function screenToSpectrogramCoords(screenX, screenY) {
             if (!spectrogramRect) return null;
-            
+
             // 获取相机显示区域
             const videoRect = camera.getBoundingClientRect();
             const scaleX = captureCanvas.width / videoRect.width;
             const scaleY = captureCanvas.height / videoRect.height;
-            
+
             // 转换到相机坐标
             const cameraX = (screenX - videoRect.left) * scaleX;
             const cameraY = (screenY - videoRect.top) * scaleY;
-            
+
             // 转换到频谱图坐标
             const spectX = (cameraX - spectrogramRect.x) / spectrogramRect.width;
             const spectY = (cameraY - spectrogramRect.y) / spectrogramRect.height;
-            
+
             // 检查是否在频谱图范围内
             if (spectX >= 0 && spectX <= 1 && spectY >= 0 && spectY <= 1) {
                 return { x: spectX, y: 1 - spectY }; // Y轴翻转
             }
-            
+
             return null;
         }
-        
+
         // 音频播放
         async function initAudioContext() {
             try {
+                console.log('初始化音频上下文...');
                 audioContext = new (window.AudioContext || window.webkitAudioContext)({
                     sampleRate: SAMPLE_RATE
                 });
-                
+
                 if (audioContext.state === 'suspended') {
                     await audioContext.resume();
                 }
-                
+
+                console.log('音频上下文状态:', audioContext.state);
                 updateInfo('音频系统就绪，开始滑动播放', 'found');
             } catch (error) {
                 console.error('音频初始化失败:', error);
                 updateInfo('音频初始化失败', 'error');
             }
         }
-        
+
         function playAtPosition(position) {
             if (!audioContext || !spectrogramData || isPlaying) return;
-            
+
             try {
                 // 获取当前位置的频谱数据
                 const timeIndex = Math.floor(position * spectrogramData.length);
                 const frameData = spectrogramData[Math.min(timeIndex, spectrogramData.length - 1)];
-                
+
                 if (!frameData) return;
-                
+
                 // 生成音频
                 const audioBuffer = synthesizeAudio(frameData);
                 if (audioBuffer) {
                     playAudioBuffer(audioBuffer);
                 }
-                
+
             } catch (error) {
                 console.error('播放失败:', error);
             }
         }
-        
+
         function synthesizeAudio(magnitudes) {
             const bufferLength = 2048; // 短音频片段
             const buffer = audioContext.createBuffer(1, bufferLength, SAMPLE_RATE);
             const channelData = buffer.getChannelData(0);
-            
+
             // 简单的加法合成
             for (let i = 0; i < bufferLength; i++) {
                 let sample = 0;
-                
+
                 for (let f = 0; f < magnitudes.length; f++) {
                     const frequency = (f / magnitudes.length) * (SAMPLE_RATE / 2);
                     const amplitude = magnitudes[f] * 0.1; // 降低音量
                     const phase = (i / SAMPLE_RATE) * frequency * 2 * Math.PI;
                     sample += amplitude * Math.sin(phase);
                 }
-                
+
                 channelData[i] = Math.tanh(sample); // 软限幅
             }
-            
+
             return buffer;
         }
-        
+
         function playAudioBuffer(buffer) {
             if (isPlaying) return;
-            
+
             isPlaying = true;
-            
+
             const source = audioContext.createBufferSource();
             source.buffer = buffer;
             source.connect(audioContext.destination);
-            
+
             source.onended = () => {
                 isPlaying = false;
             };
-            
+
             source.start(0);
-            
+
             // 短暂播放后自动停止
             setTimeout(() => {
                 try {
                     source.stop();
-                } catch (e) {}
+                } catch (e) { }
                 isPlaying = false;
             }, 100);
         }
-        
+
         function stopAudio() {
             isPlaying = false;
         }
-        
+
         // 绘制覆盖层
         function drawOverlay() {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
-            
+
+            // 绘制手指位置（无论是否检测到频谱图）
+            if (fingerPosition) {
+                // 绘制手指位置的十字线
+                ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
+                ctx.lineWidth = 2;
+                ctx.setLineDash([5, 5]);
+                
+                // 垂直线
+                ctx.beginPath();
+                ctx.moveTo(fingerPosition.x, 0);
+                ctx.lineTo(fingerPosition.x, canvas.height);
+                ctx.stroke();
+                
+                // 水平线
+                ctx.beginPath();
+                ctx.moveTo(0, fingerPosition.y);
+                ctx.lineTo(canvas.width, fingerPosition.y);
+                ctx.stroke();
+                
+                ctx.setLineDash([]);
+                
+                // 绘制手指位置圆点
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+                ctx.beginPath();
+                ctx.arc(fingerPosition.x, fingerPosition.y, 8, 0, 2 * Math.PI);
+                ctx.fill();
+            }
+
             if (spectrogramRect) {
                 // 绘制频谱图边框
                 const videoRect = camera.getBoundingClientRect();
                 const scaleX = videoRect.width / captureCanvas.width;
                 const scaleY = videoRect.height / captureCanvas.height;
-                
+
                 const x = videoRect.left + spectrogramRect.x * scaleX;
                 const y = videoRect.top + spectrogramRect.y * scaleY;
                 const width = spectrogramRect.width * scaleX;
                 const height = spectrogramRect.height * scaleY;
-                
+
                 ctx.strokeStyle = 'rgba(0, 255, 170, 0.8)';
-                ctx.lineWidth = 2;
+                ctx.lineWidth = 3;
                 ctx.strokeRect(x, y, width, height);
-                
-                // 绘制播放位置指示线
+
+                // 绘制播放位置指示线（在频谱图内）
                 if (fingerPosition) {
                     const spectPos = screenToSpectrogramCoords(fingerPosition.x, fingerPosition.y);
                     if (spectPos) {
                         const lineX = x + spectPos.x * width;
-                        ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
-                        ctx.lineWidth = 3;
+                        ctx.strokeStyle = 'rgba(255, 255, 0, 0.9)';
+                        ctx.lineWidth = 4;
                         ctx.beginPath();
                         ctx.moveTo(lineX, y);
                         ctx.lineTo(lineX, y + height);
                         ctx.stroke();
+                        
+                        // 添加播放头顶部标记
+                        ctx.fillStyle = 'rgba(255, 255, 0, 0.9)';
+                        ctx.beginPath();
+                        ctx.moveTo(lineX, y);
+                        ctx.lineTo(lineX - 8, y - 12);
+                        ctx.lineTo(lineX + 8, y - 12);
+                        ctx.closePath();
+                        ctx.fill();
                     }
                 }
             }
         }
-        
+
         // 控制按钮事件
         async function toggleCamera() {
             // 切换前后摄像头
@@ -737,37 +810,38 @@
                 const stream = camera.srcObject;
                 const tracks = stream.getVideoTracks();
                 tracks.forEach(track => track.stop());
-                
+
                 const currentFacingMode = tracks[0].getSettings().facingMode;
                 const newFacingMode = currentFacingMode === 'environment' ? 'user' : 'environment';
-                
+
                 const newStream = await navigator.mediaDevices.getUserMedia({
                     video: { facingMode: newFacingMode }
                 });
-                
+
                 camera.srcObject = newStream;
                 await camera.play();
-                
+
                 resizeCanvas();
-                
+
             } catch (error) {
                 console.error('切换摄像头失败:', error);
             }
         }
-        
+
         function recalibrate() {
             spectrogramRect = null;
             spectrogramData = null;
             updateInfo('重新校准中，请对准频谱图', 'searching');
         }
-        
+
         function toggleDebug() {
             const isVisible = debugPanel.style.display !== 'none';
             debugPanel.style.display = isVisible ? 'none' : 'block';
         }
-        
+
         // 启动应用
         init();
     </script>
 </body>
+
 </html>
