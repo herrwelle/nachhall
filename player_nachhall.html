@@ -640,12 +640,15 @@
             // 计算在频谱图中的位置
             const spectPosition = screenToSpectrogramCoords(x, y);
             if (spectPosition) {
+                console.log('频谱位置:', spectPosition.x);
                 playAtPosition(spectPosition.x);
                 updateDebug(
                     `${spectrogramRect.width}x${spectrogramRect.height}`,
                     `${spectPosition.x.toFixed(2)}`,
                     isPlaying ? '播放中' : '就绪'
                 );
+            } else {
+                console.log('手指不在频谱图范围内');
             }
         }
 
@@ -896,7 +899,20 @@
         }
 
         function playAtPosition(position) {
-            if (!audioContext || !spectrogramData || isPlaying) return;
+            console.log('playAtPosition调用:', position);
+
+            if (!audioContext) {
+                console.log('音频上下文未初始化');
+                return;
+            }
+            if (!spectrogramData) {
+                console.log('频谱数据不存在');
+                return;
+            }
+            if (isPlaying) {
+                console.log('正在播放中，跳过');
+                return;
+            }
 
             try {
                 // 使用线性插值获取更平滑的频谱数据
@@ -942,35 +958,80 @@
 
             const magnitudes = frameData.magnitudes;
 
-            // 分析频谱特征
-            const features = analyzeVocalFeatures(magnitudes);
+            try {
+                // 分析频谱特征
+                const features = analyzeVocalFeatures(magnitudes);
+                console.log('合成特征:', features);
 
-            if (features.f0 === 0) {
-                return buffer; // 静音
+                if (features.f0 === 0) {
+                    console.log('没有检测到基频，使用备用合成');
+                    return synthesizeAudioFallback(frameData);
+                }
+
+                // 源-滤波器合成
+                for (let i = 0; i < bufferLength; i++) {
+                    const t = i / SAMPLE_RATE;
+
+                    // 1. 声门激励源（模拟声带振动）
+                    const excitation = generateGlottalPulse(features.f0, t, features.voicing);
+
+                    // 2. 声道滤波（模拟口腔共振）
+                    const filtered = applyVocalTractFilter(excitation, features.formants, t);
+
+                    // 3. 添加气流噪声（模拟呼吸和摩擦）
+                    const noise = generateAspirationNoise(features.breathiness, t);
+
+                    // 4. 非线性效应（模拟声带张力变化）
+                    let sample = filtered + noise;
+                    sample = applyNonlinearEffects(sample, features.roughness);
+
+                    // 5. 动态包络
+                    const envelope = getDynamicEnvelope(t, bufferLength / SAMPLE_RATE, features.attack, features.decay);
+                    sample *= envelope;
+
+                    channelData[i] = Math.tanh(sample * 0.7) * 0.9;
+                }
+
+                return buffer;
+
+            } catch (error) {
+                console.error('高级合成失败，使用备用方法:', error);
+                return synthesizeAudioFallback(frameData);
             }
+        }
 
-            // 源-滤波器合成
+        // 备用合成方法
+        function synthesizeAudioFallback(frameData) {
+            console.log('使用备用合成方法');
+            const bufferLength = 4096;
+            const buffer = audioContext.createBuffer(1, bufferLength, SAMPLE_RATE);
+            const channelData = buffer.getChannelData(0);
+
+            const magnitudes = frameData.magnitudes;
+
+            // 简单但可靠的频谱合成
             for (let i = 0; i < bufferLength; i++) {
                 const t = i / SAMPLE_RATE;
+                let sample = 0;
 
-                // 1. 声门激励源（模拟声带振动）
-                const excitation = generateGlottalPulse(features.f0, t, features.voicing);
+                // 直接从频谱重建
+                for (let f = 1; f < Math.min(magnitudes.length, 150); f++) {
+                    const magnitude = magnitudes[f];
+                    if (magnitude > 0.03) {
+                        const frequency = (f / magnitudes.length) * (SAMPLE_RATE / 2);
 
-                // 2. 声道滤波（模拟口腔共振）
-                const filtered = applyVocalTractFilter(excitation, features.formants, t);
+                        if (frequency > 100 && frequency < 3000) {
+                            const phase = 2 * Math.PI * frequency * t;
+                            sample += magnitude * Math.sin(phase) * 0.5;
+                        }
+                    }
+                }
 
-                // 3. 添加气流噪声（模拟呼吸和摩擦）
-                const noise = generateAspirationNoise(features.breathiness, t);
-
-                // 4. 非线性效应（模拟声带张力变化）
-                let sample = filtered + noise;
-                sample = applyNonlinearEffects(sample, features.roughness);
-
-                // 5. 动态包络
-                const envelope = getDynamicEnvelope(t, bufferLength / SAMPLE_RATE, features.attack, features.decay);
+                // 简单包络
+                const envelope = Math.exp(-t * 2) * (1 + 0.1 * Math.sin(2 * Math.PI * 8 * t));
                 sample *= envelope;
 
-                channelData[i] = Math.tanh(sample * 0.7) * 0.9;
+                channelData[i] = Math.tanh(sample * 0.8) * 0.7;
             }
 
             return buffer;
@@ -1028,7 +1089,7 @@
             features.voicing = f0Result.strength;
 
             // 共振峰检测
-            features.formants = detectFormants(magnitudes);
+            features.formants = findFormants(magnitudes);
 
             // 声音质量分析
             features.breathiness = analyzeBreathiness(magnitudes);
