@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-<title>Nachhall 播放 · 相机驱动</title>
+<title>Nachhall 播放 · 快照拉正 + 1× 播放（手指辅助）</title>
 <style>
   :root{color-scheme:dark}
   html,body{margin:0;height:100%;background:#000;color:#fff;font-family:system-ui,-apple-system,Segoe UI}
-  #stage{position:fixed;inset:0;display:grid;place-items:center;background:#000}
+  #stage{position:fixed;inset:0;display:grid;place-items:center}
   video{max-width:100vw;max-height:100vh;display:block;opacity:.98}
   #ui{position:fixed;inset:0;pointer-events:none}
   #frame{position:fixed;inset:0;pointer-events:none}
@@ -21,111 +21,76 @@
 <div id="frame" class="white"></div>
 
 <script>
-/* 与编码页一致 */
-const SR=16000, DUR=3.0, NFFT=1024, HOP=128;
-const W=1024, H=640, H_PILOT=32, H_SPEC=H-H_PILOT, LAMBDA=16;
+/* ============ 固定规格（与你编码图的“规范坐标”一致即可） ============ */
+const CAN_W = 1024;         // 规范图宽（像素）
+const CAN_H = 640;          // 规范图高（像素）
+const TOP_MARGIN = 0;       // 若编码图顶端留了导引条，这里可设为其高度；没有就 0
+const SPEC_X = 0, SPEC_Y = TOP_MARGIN, SPEC_W = CAN_W, SPEC_H = CAN_H - TOP_MARGIN;
 
-/* 相机与缓冲 */
-const cam=document.getElementById('cam'), ui=document.getElementById('ui'), frame=document.getElementById('frame');
+/* 下采样到的谱矩阵尺寸（越大越细，CPU 越高） */
+const C = 512;  // 列数（时间分辨）
+const K = 512;  // 频带数（频率分辨）
+
+/* 音频引擎参数 */
+const SR = 16000;  // 合成采样率
+const DUR = 3.0;   // 目标时长（秒），用于把列索引映射为时间
+
+/* ============ 相机启动 ============ */
+const cam = document.getElementById('cam');
+const ui  = document.getElementById('ui');
+const frame = document.getElementById('frame');
+
 let capCv=null, capCtx=null;
-
-/* 音频合成：AudioWorklet（相位连续的加法合成 phase vocoder） */
-let actx=null, node=null;
-async function ensureAudio(){
-  if(actx) return;
-  actx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
-  const code=`
-  class PV extends AudioWorkletProcessor{
-    constructor(){
-      super();
-      this.K=256;           // 频率 bin（下采样到 256）
-      this.C=384;           // 列（下采样到 384）
-      this.sr=${SR};
-      this.cols=null;       // Float32Array 长 K*C（按列存储）
-      this.phi=new Float32Array(this.K);
-      this.gain=0;          // 速度门控
-      this.x=0; this.dx=0;  // 列位置及每样本位移
-      // 频率表
-      this.f=new Float32Array(this.K);
-      const ny=this.sr/2; for(let k=0;k<this.K;k++){ this.f[k]=k*ny/(this.K-1); }
-      this.port.onmessage = e=>{
-        const m=e.data;
-        if(m.t==='spec'){ this.K=m.K; this.C=m.C; this.cols=m.data; this.phi.fill(0); }
-        else if(m.t==='state'){ this.x=m.x; this.dx=m.dx; this.gain=m.g; }
-      };
-    }
-    process(_, outs){
-      const out=outs[0][0]; out.fill(0);
-      if(!this.cols) return true;
-      let x=this.x, dx=this.dx, C=this.C, K=this.K;
-      for(let n=0;n<out.length;n++){
-        const col0 = Math.floor(x), a = x - col0, col1 = (col0+1<C)?(col0+1):col0;
-        let s=0;
-        for(let k=0;k<K;k++){
-          const A0 = this.cols[col0*K + k], A1 = this.cols[col1*K + k];
-          const A = A0*(1-a)+A1*a;
-          this.phi[k] += 2*Math.PI*this.f[k]/this.sr; // 相位连续推进
-          s += A * Math.sin(this.phi[k]);
-        }
-        out[n] = Math.tanh(s*0.4) * this.gain; // 软限幅 + 速度门控
-        x += dx;
-        if(x<0) x=0; else if(x>C-1) x=C-1;
-      }
-      this.x=x;
-      return true;
-    }
+(async ()=>{
+  try{
+    const s = await navigator.mediaDevices.getUserMedia({
+      video:{ facingMode:'environment', width:{ideal:1280}, height:{ideal:720} }
+    });
+    cam.srcObject = s; await cam.play();
+    capCv = document.createElement('canvas');
+    capCv.width  = cam.videoWidth  || 1280;
+    capCv.height = cam.videoHeight || 720;
+    capCtx = capCv.getContext('2d', {willReadFrequently:true});
+    requestAnimationFrame(loop);
+  }catch(e){
+    alert('相机启动失败：请在 HTTPS 下并允许相机权限');
   }
-  registerProcessor('pv',PV);
-  `;
-  const blob=new Blob([code],{type:'application/javascript'}); const url=URL.createObjectURL(blob);
-  await actx.audioWorklet.addModule(url); URL.revokeObjectURL(url);
-  node=new AudioWorkletNode(actx,'pv',{numberOfInputs:0,numberOfOutputs:1,outputChannelCount:[1]});
-  node.connect(actx.destination);
-}
+})();
 
-/* 画面：角点检测 → 透视矫正 → 提取导引条相位与频谱矩阵 */
+/* ============ 找黑框四角（简洁稳健版） ============ */
 function grayAt(d,i){ return 0.2126*d[i]+0.7152*d[i+1]+0.0722*d[i+2]; }
-function findCorners(img,W,H){ // 在四角各找最大黑块重心（简单稳健）
-  const data=img.data, th=80, sz= Math.floor(Math.min(W,H)/8);
-  function search(x0,y0,wx,hy){
+function findCorners(img,W,H){
+  const data=img.data, th = 90; // 黑色阈值（可按现场微调）
+  const w3=W/3|0, h3=H/3|0;
+  function bestIn(x0,y0, w,h){
     let best={area:0,cx:0,cy:0};
-    for(let y=y0;y<y0+hy;y+=2){
-      for(let x=x0;x<x0+wx;x+=2){
-        const i=(y*W+x)*4; if(grayAt(data,i)<th){
-          // 估一小块连通（近似以固定窗口）
-          let area=0,cx=0,cy=0;
-          const ww=sz/4, hh=sz/4;
-          for(let yy=y; yy<y+hh && yy<H; yy+=2){
+    for(let y=y0;y<y0+h;y+=2){
+      for(let x=x0;x<x0+w;x+=2){
+        const i=(y*W+x)*4, g=grayAt(data,i);
+        if(g<th){
+          let area=0, sx=0, sy=0;
+          const ww=10, hh=10;
+          for(let yy=y; yy<y+hh && yy<H; yy+=2)
             for(let xx=x; xx<x+ww && xx<W; xx+=2){
-              const ii=(yy*W+xx)*4; const g=grayAt(data,ii); if(g<th){ area++; cx+=xx; cy+=yy; }
+              const ii=(yy*W+xx)*4; if(grayAt(data,ii)<th){ area++; sx+=xx; sy+=yy; }
             }
-          }
-          if(area>best.area){ best={area,cx:cx/Math.max(1,area),cy:cy/Math.max(1,area)}; }
+          if(area>best.area) best={area,cx:sx/area,cy:sy/area};
         }
       }
     }
     return best.area? {x:best.cx,y:best.cy}: null;
   }
-  const c1=search(0,0, W/3, H/3);             // 左上
-  const c2=search(W*2/3,0, W/3, H/3);         // 右上
-  const c3=search(0,H*2/3, W/3, H/3);         // 左下
-  const c4=search(W*2/3,H*2/3, W/3, H/3);     // 右下
-  if(c1&&c2&&c3&&c4) return [c1,c2,c3,c4];
+  const tl=bestIn(0,0, w3,h3), tr=bestIn(W-w3,0, w3,h3),
+        bl=bestIn(0,H-h3, w3,h3), br=bestIn(W-w3,H-h3, w3,h3);
+  if(tl&&tr&&bl&&br) return [tl,tr,bl,br];
   return null;
 }
-// 求单应矩阵 H (3x3)，把 src 四点映射到标准矩形 (0,0)-(W,H)
-function getHomography(p){ // p: [tl,tr,bl,br]
-  function mat3Inv(m){ const a=m, b=new Float64Array(9);
-    const A=a[0],B=a[1],C=a[2],D=a[3],E=a[4],F=a[5],G=a[6],Hh=a[7],I=a[8];
-    const det=A*(E*I-F*Hh)-B*(D*I-F*G)+C*(D*Hh-E*G);
-    b[0]=(E*I-F*Hh)/det; b[1]=(C*Hh-B*I)/det; b[2]=(B*F-C*E)/det;
-    b[3]=(F*G-D*I)/det;  b[4]=(A*I-C*G)/det;  b[5]=(C*D-A*F)/det;
-    b[6]=(D*Hh-E*G)/det; b[7]=(B*G-A*Hh)/det; b[8]=(A*E-B*D)/det; return b;
-  }
+
+/* ============ 单应矫正（把相机帧拉到规范坐标） ============ */
+function getHomography(p){
   const [tl,tr,bl,br]=p;
-  const src=[tl.x,tl.y, tr.x,tr.y, bl.x,bl.y, br.x,br.y];
-  const dst=[0,0, W,0, 0,H, W,H];
-  // 直接解八元一次：参见常规模板
+  const s=[tl.x,tl.y, tr.x,tr.y, bl.x,bl.y, br.x,br.y];
+  const d=[0,0, CAN_W,0, 0,CAN_H, CAN_W,CAN_H];
   function solveH(s,d){
     const [x0,y0,x1,y1,x2,y2,x3,y3]=s, [X0,Y0,X1,Y1,X2,Y2,X3,Y3]=d;
     const M=[
@@ -139,167 +104,215 @@ function getHomography(p){ // p: [tl,tr,bl,br]
       0,0,0, x3,y3,1, -Y3*x3,-Y3*y3
     ];
     const B=[X0,Y0,X1,Y1,X2,Y2,X3,Y3];
-    // 解 8x8（高斯消元）
-    const A=new Float64Array(64); for(let i=0;i<64;i++) A[i]=M[i];
-    const bb=new Float64Array(8); for(let i=0;i<8;i++) bb[i]=B[i];
+    const A=new Float64Array(64), bb=new Float64Array(8);
+    for(let i=0;i<64;i++) A[i]=M[i]; for(let i=0;i<8;i++) bb[i]=B[i];
     for(let i=0;i<8;i++){
-      // 选主元
       let piv=i, pv=Math.abs(A[i*8+i]);
       for(let r=i+1;r<8;r++){ const v=Math.abs(A[r*8+i]); if(v>pv){pv=v;piv=r;} }
       if(piv!==i){ for(let c=i;c<8;c++){ [A[i*8+c],A[piv*8+c]]=[A[piv*8+c],A[i*8+c]]; } [bb[i],bb[piv]]=[bb[piv],bb[i]]; }
       const d=A[i*8+i]; for(let c=i;c<8;c++) A[i*8+c]/=d; bb[i]/=d;
       for(let r=0;r<8;r++) if(r!==i){ const mul=A[r*8+i]; for(let c=i;c<8;c++) A[r*8+c]-=mul*A[i*8+c]; bb[r]-=mul*bb[i]; }
     }
-    const h=new Float64Array(9); for(let i=0;i<8;i++) h[i]=bb[i]; h[8]=1;
-    return h;
+    const h=new Float64Array(9); for(let i=0;i<8;i++) h[i]=bb[i]; h[8]=1; return h;
   }
-  return solveH([p[0].x,p[0].y,p[1].x,p[1].y,p[2].x,p[2].y,p[3].x,p[3].y],[0,0,W,0,0,H,W,H]);
+  return solveH(s,d);
 }
-// 逆变换采样
 function warpToCanonical(srcImg,W0,H0,Hm){
-  const dst = new ImageData(W,H); const d=dst.data, s=srcImg.data;
+  const d=new ImageData(CAN_W,CAN_H), dst=d.data, s=srcImg.data;
   // 先求逆矩阵
-  const h=Hm, inv=(function(){
-    const a=new Float64Array([h[0],h[1],h[2],h[3],h[4],h[5],h[6],h[7],h[8]]);
-    // 3x3 逆
-    const A=a[0],B=a[1],C=a[2],D=a[3],E=a[4],F=a[5],G=a[6],H=a[7],I=a[8];
-    const det=A*(E*I-F*H)-B*(D*I-F*G)+C*(D*H-E*G);
-    return new Float64Array([
-      (E*I-F*H)/det, (C*H-B*I)/det, (B*F-C*E)/det,
-      (F*G-D*I)/det, (A*I-C*G)/det, (C*D-A*F)/det,
-      (D*H-E*G)/det, (B*G-A*H)/det, (A*E-B*D)/det
-    ]);
-  })();
-  function bilinear(x,y){
+  const a=Hm, A=a[0],B=a[1],C=a[2],D=a[3],E=a[4],F=a[5],G=a[6],H=a[7],I=a[8];
+  const det=A*(E*I-F*H)-B*(D*I-F*G)+C*(D*H-E*G);
+  const inv=[
+    (E*I-F*H)/det, (C*H-B*I)/det, (B*F-C*E)/det,
+    (F*G-D*I)/det, (A*I-C*G)/det, (C*D-A*F)/det,
+    (D*H-E*G)/det, (B*G-A*H)/det, (A*E-B*D)/det
+  ];
+  function sample(x,y){
     const x0=Math.floor(x), y0=Math.floor(y), x1=Math.min(W0-1,x0+1), y1=Math.min(H0-1,y0+1);
     const a=x-x0, b=y-y0;
     const i00=(y0*W0+x0)*4, i10=(y0*W0+x1)*4, i01=(y1*W0+x0)*4, i11=(y1*W0+x1)*4;
-    function lerp(i0,i1,t){ return [ s[i0]*(1-t)+s[i1]*t, s[i0+1]*(1-t)+s[i1+1]*t, s[i0+2]*(1-t)+s[i1+2]*t, 255 ]; }
-    const r0=lerp(i00,i10,a), r1=lerp(i01,i11,a);
-    return [ r0[0]*(1-b)+r1[0]*b, r0[1]*(1-b)+r1[1]*b, r0[2]*(1-b)+r1[2]*b, 255 ];
+    const r00=s[i00],g00=s[i00+1],b00=s[i00+2];
+    const r10=s[i10],g10=s[i10+1],b10=s[i10+2];
+    const r01=s[i01],g01=s[i01+1],b01=s[i01+2];
+    const r11=s[i11],g11=s[i11+1],b11=s[i11+2];
+    const r0=r00*(1-a)+r10*a, g0=g00*(1-a)+g10*a, b0=b00*(1-a)+b10*a;
+    const r1=r01*(1-a)+r11*a, g1=g01*(1-a)+g11*a, b1=b01*(1-a)+b11*a;
+    return [ r0*(1-b)+r1*b, g0*(1-b)+g1*b, b0*(1-b)+b1*b ];
   }
-  for(let y=0;y<H;y++){
-    for(let x=0;x<W;x++){
+  for(let y=0;y<CAN_H;y++){
+    for(let x=0;x<CAN_W;x++){
       const X=inv[0]*x+inv[1]*y+inv[2], Y=inv[3]*x+inv[4]*y+inv[5], Z=inv[6]*x+inv[7]*y+inv[8];
       const sx=X/Z, sy=Y/Z;
+      const idx=(y*CAN_W+x)*4;
       if(sx>=0&&sx<W0&&sy>=0&&sy<H0){
-        const px=bilinear(sx,sy), idx=(y*W+x)*4; d[idx]=px[0]; d[idx+1]=px[1]; d[idx+2]=px[2]; d[idx+3]=255;
+        const [r,g,b]=sample(sx,sy);
+        dst[idx]=r; dst[idx+1]=g; dst[idx+2]=b; dst[idx+3]=255;
+      }else{
+        dst[idx]=dst[idx+1]=dst[idx+2]=0; dst[idx+3]=255;
       }
     }
   }
-  return dst;
+  return d;
 }
 
-/* 从规范图提取：导引条相位 + 频谱矩阵（下采样到 K=256, C=384） */
-function extractFromCanonical(img){
+/* ============ 从规范图提取谱矩阵（灰度→幅度，黑=强） ============ */
+function extractSpecMatrix(img){
   const data=img.data;
-  // 1) 频谱矩阵（灰度→强度，0..1；黑=强）
-  const C=384, K=256; // 下采样以减轻 CPU
-  const cols=new Float32Array(C*K); // 按列存储，便于 Worklet 插值
+  const cols=new Float32Array(C*K); // 按列存储，方便插值
+  // 估计对比度（10%/90% 分位），做线性拉伸
+  const samp=[]; for(let i=0;i<800;i++){ const x=(Math.random()*SPEC_W)|0, y=SPEC_Y + (Math.random()*SPEC_H)|0; const idx=(y*CAN_W+(SPEC_X+x))*4; const g=0.2126*data[idx]+0.7152*data[idx+1]+0.0722*data[idx+2]; samp.push(g); }
+  samp.sort((a,b)=>a-b); const p10=samp[(samp.length*0.10)|0], p90=samp[(samp.length*0.90)|0]; const denom=Math.max(8,p90-p10);
+  const mapG = g => Math.max(0, Math.min(1, 1 - (g-p10)/denom)); // 黑→1
+
   for(let cx=0; cx<C; cx++){
-    const x = Math.round(cx*(W-1)/(C-1));
+    const x = SPEC_X + Math.round(cx*(SPEC_W-1)/(C-1));
     for(let ky=0; ky<K; ky++){
-      const y = H_PILOT + Math.round( (H_SPEC-1) - ky*(H_SPEC-1)/(K-1) );
-      const idx=(y*W+x)*4;
+      const y = SPEC_Y + Math.round((SPEC_H-1) - ky*(SPEC_H-1)/(K-1));
+      const idx=(y*CAN_W+x)*4;
       const g = 0.2126*data[idx]+0.7152*data[idx+1]+0.0722*data[idx+2];
-      const t = 1 - (g/255); // 黑→1
-      // 轻量去噪
-      const A = Math.pow(Math.max(0,t), 1.2);
-      cols[cx*K + ky] = A * (ky/K); // 高频稍降权，减电子味
+      let a = mapG(g);
+      // 轻度去“电子味”：给高频一点衰减
+      a *= 0.6 + 0.4*(ky/K);
+      cols[cx*K + ky] = a;
     }
   }
-  // 2) 导引条：正弦条纹相位
-  // 参考信号 sin/cos
-  let I=0,Q=0; // 积分相关
-  for(let x=0;x<W;x++){
-    const idx=(Math.floor(H_PILOT/2)*W + x)*4;
-    const g=0.2126*data[idx]+0.7152*data[idx+1]+0.0722*data[idx+2];
-    const d = 1 - (g/255); // 黑为正
-    const cs=Math.cos(2*Math.PI*x/LAMBDA), sn=Math.sin(2*Math.PI*x/LAMBDA);
-    I += d*cs; Q += d*sn;
+  return {cols, C, K};
+}
+
+/* ============ AudioWorklet：相位连续加法合成（1× 播放） ============ */
+let actx=null, node=null;
+async function ensureAudio(){
+  if(actx) return;
+  actx = new (window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
+  const code = `
+  class PV extends AudioWorkletProcessor{
+    constructor(){
+      super();
+      this.C=0; this.K=0; this.cols=null;
+      this.x=0; this.dx=0;      // 每样本前进的“列”数
+      this.f=null; this.phi=null;
+      this.gain=1.0;            // 总增益
+      this.port.onmessage = e=>{
+        const m=e.data;
+        if(m.t==='spec'){
+          this.C=m.C; this.K=m.K; this.cols=m.cols;
+          this.f=new Float32Array(this.K);
+          const ny = sampleRate/2;
+          for(let k=0;k<this.K;k++) this.f[k]=k*ny/(this.K-1);
+          this.phi=new Float32Array(this.K); this.phi.fill(0);
+        }else if(m.t==='state'){
+          this.x=m.x; this.dx=m.dx; this.gain=m.gain;
+        }
+      };
+    }
+    process(_, outs){
+      const out=outs[0][0]; out.fill(0);
+      if(!this.cols||!this.f) return true;
+      let x=this.x, dx=this.dx, C=this.C, K=this.K, phi=this.phi, f=this.f, cols=this.cols, g=this.gain;
+      for(let n=0;n<out.length;n++){
+        let s=0;
+        const c0 = Math.floor(x), a = x - c0, c1 = (c0+1<C)?(c0+1):c0;
+        const off0=c0*K, off1=c1*K;
+        for(let k=0;k<K;k++){
+          const A = cols[off0+k]*(1-a) + cols[off1+k]*a;
+          phi[k] += 2*Math.PI*f[k]/sampleRate;        // 相位连续推进
+          s += A * Math.sin(phi[k]);
+        }
+        out[n] = Math.tanh(s*0.35) * g;              // 软限幅
+        x += dx;
+        if(x<0) x=0; else if(x>C-1) x=C-1;           // 到边界就停
+      }
+      this.x=x; return true;
+    }
   }
-  const phi = Math.atan2(Q,I); // [-π,π]
-  return {cols, C, K, phi};
+  registerProcessor('pv', PV);
+  `;
+  const blob=new Blob([code],{type:'application/javascript'}), url=URL.createObjectURL(blob);
+  await actx.audioWorklet.addModule(url); URL.revokeObjectURL(url);
+  node=new AudioWorkletNode(actx,'pv',{numberOfInputs:0,numberOfOutputs:1,outputChannelCount:[1]});
+  node.connect(actx.destination);
 }
 
-/* 位置/速度估计（相位解包 + 平滑） */
-let lastPhi=null, unwrap=0, lastT=0, xNorm=0, vNorm=0; // x/v 用「列」为单位
-function updatePhase(phi, dt){
-  if(lastPhi==null){ lastPhi=phi; lastT=performance.now()*0.001; return; }
-  // 解包：把相位差约束到 [-π,π] 再累计
-  let dphi = phi - lastPhi;
-  while(dphi>Math.PI) dphi-=2*Math.PI;
-  while(dphi<-Math.PI) dphi+=2*Math.PI;
-  unwrap += dphi;
-  lastPhi = phi;
-  const dx_pixels = unwrap * (LAMBDA/(2*Math.PI)); // 相位→像素位移
-  // 像素→列（W 对应 C 列）
-  xNorm = (dx_pixels / W) * specC; // specC 稍后设
-  // 速度（列/秒），指数平滑
-  const v = (dphi/(2*Math.PI)) * (LAMBDA/dt) / W * specC;
-  vNorm = 0.85*vNorm + 0.15*v;
+/* ============ 主循环：锁定→快照→抽谱→播放（1×），手指可随时落针/拖动 ============ */
+let frozen=null;            // ImageData of canonical
+let spec=null;              // {cols,C,K}
+let playing=false;
+let playhead=0;             // 0..C-1
+let lastT=0;
+
+function drawPlayhead(){
+  const ctx=ui.getContext('2d');
+  const rect=cam.getBoundingClientRect();
+  ui.width=innerWidth; ui.height=innerHeight;
+  ctx.clearRect(0,0,ui.width,ui.height);
+  if(!playing) return;
+  // 屏幕上的竖线（按规范坐标等比映射到 video 的可视区域）
+  const x = Math.round(rect.left + (playhead/(C-1))*rect.width);
+  ctx.strokeStyle='rgba(255,255,255,.95)'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(x, rect.top); ctx.lineTo(x, rect.bottom); ctx.stroke();
 }
 
-/* 主循环 */
-let specC=384, specK=256, haveSpec=false;
-(async function start(){
-  try{
-    const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment', width:{ideal:1280}, height:{ideal:720}}});
-    cam.srcObject=s; await cam.play();
-    capCv=document.createElement('canvas'); capCv.width=cam.videoWidth||1280; capCv.height=cam.videoHeight||720; capCtx=capCv.getContext('2d',{willReadFrequently:true});
-    loop();
-  }catch(e){ alert('相机启动失败，请在 HTTPS 下授权相机'); }
-})();
-
-let lastTimePerf=performance.now();
 async function loop(){
   capCtx.drawImage(cam,0,0,capCv.width,capCv.height);
   const img=capCtx.getImageData(0,0,capCv.width,capCv.height);
-  // 找角点
-  const cs=findCorners(img,capCv.width,capCv.height);
-  if(cs){
-    frame.className='green';
-    // 排成 tl,tr,bl,br
-    const tl=cs[0], tr=cs[1], bl=cs[2], br=cs[3];
-    const Hm=getHomography([tl,tr,bl,br]);
-    const can=warpToCanonical(img,capCv.width,capCv.height,Hm); // 变到 1024×640
-    // 提取频谱矩阵 & 相位
-    const {cols,C,K,phi}=extractFromCanonical(can);
-    specC=C; specK=K;
-    if(!haveSpec){
+  if(!frozen){
+    const cs=findCorners(img, capCv.width, capCv.height);
+    if(cs){
+      frame.className='green';
+      // 第一次稳定后马上“冻结”
+      const Hm=getHomography(cs);
+      frozen = warpToCanonical(img, capCv.width, capCv.height, Hm);
+      // 提取谱矩阵
+      spec = extractSpecMatrix(frozen);
+      // 启动音频：1× 正常播放
       await ensureAudio();
-      node.port.postMessage({t:'spec', K:specK, C:specC, data:cols});
-      haveSpec=true; unwrap=0; lastPhi=null; xNorm=0; vNorm=0;
+      node.port.postMessage({t:'spec', C:spec.C, K:spec.K, cols:spec.cols});
+      const dx = (spec.C/DUR)/SR; // 每样本推进多少列 = (列/秒)/采样率
+      node.port.postMessage({t:'state', x:0, dx, gain:1.0});
+      playing=true; playhead=0; lastT=performance.now()*0.001;
     }else{
-      // 只在首次发送矩阵，之后可选每几帧增量刷新；这儿简单起见每帧整块刷新（矩阵小，OK）
-      node.port.postMessage({t:'spec', K:specK, C:specC, data:cols});
+      frame.className='white';
     }
-    // 相位更新 → 位置/速度
-    const now=performance.now(); const dt=Math.max(1, now-lastTimePerf)/1000; lastTimePerf=now;
-    updatePhase(phi, dt);
-    // 速度门限（太慢≈静音）
-    const v1x = specC / DUR; // 1× 速度（列/秒）
-    const gain = Math.max(0, Math.min(1, Math.abs(vNorm)/(0.35*v1x)));
-    const dxPerSample = (vNorm/specC) * (specC/DUR) / SR * specC; // 简化：按列/秒 → 每样本位移的列数
-    node.port.postMessage({t:'state', x:Math.max(0,Math.min(specC-1,xNorm)), dx:dxPerSample, g:gain});
-    drawUI(can, xNorm/specC);
   }else{
-    frame.className='white';
-    haveSpec=false;
+    // 已冻结：只画 UI（相机画面保留作背景）
+    if(playing){
+      // 依据时钟推进本地 playhead（1×）
+      const t=performance.now()*0.001, dt=t-lastT; lastT=t;
+      playhead += (spec.C/DUR)*dt; if(playhead>=spec.C) playhead=spec.C-1; // 到边界停（或你想循环也行）
+      node.port.postMessage({t:'state', x:playhead, dx:(spec.C/DUR)/SR, gain:1.0});
+    }
   }
+  drawPlayhead();
   requestAnimationFrame(loop);
 }
 
-/* 叠加 UI（播放竖线） */
-function drawUI(can, x01){
-  ui.width=innerWidth; ui.height=innerHeight;
-  const ctx=ui.getContext('2d'); ctx.clearRect(0,0,ui.width,ui.height);
-  // 把 canonical 的竖线映射回屏幕（近似按 video 尺寸等比铺满）
-  const r=cam.getBoundingClientRect(); // 屏幕上的 video 矩形
-  const x = Math.round(r.left + x01 * r.width);
-  ctx.strokeStyle='rgba(255,255,255,.95)'; ctx.lineWidth=2;
-  ctx.beginPath(); ctx.moveTo(x, r.top); ctx.lineTo(x, r.top + r.height); ctx.stroke();
+/* ============ 触摸手势：落针/拖动（辅助 1×，不改时钟） ============ */
+let dragging=false;
+function pointerToCol(ev){
+  const r=cam.getBoundingClientRect();
+  const x=ev.clientX;
+  const u = (x - r.left) / r.width; // 0..1
+  return Math.max(0, Math.min(spec? (spec.C-1):0, Math.round(u*(spec.C-1))));
 }
+window.addEventListener('pointerdown', ev=>{
+  if(!spec) return;
+  dragging=true;
+  playhead = pointerToCol(ev);
+  if(node) node.port.postMessage({t:'state', x:playhead, dx:(spec.C/DUR)/SR, gain:1.0});
+  // 如需“按住才有声，松手就静音”，把下面两行的注释对调：
+  // playing=true; 
+  // node.port.postMessage({t:'state', x:playhead, dx:0, gain:1.0}); // 选择“按住 = 暂停时钟，只听你拖动的位置”
+});
+window.addEventListener('pointermove', ev=>{
+  if(!dragging||!spec) return;
+  playhead = pointerToCol(ev);
+  if(node) node.port.postMessage({t:'state', x:playhead, dx:(spec.C/DUR)/SR, gain:1.0});
+});
+window.addEventListener('pointerup', ev=>{
+  dragging=false;
+  // 如需“松手=静音”，在这里把 gain 设 0 或 dx 设 0；默认继续 1× 播放：
+  // if(node) node.port.postMessage({t:'state', x:playhead, dx:0, gain:0});
+});
 </script>
 </body>
 </html>
