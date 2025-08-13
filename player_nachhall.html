@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-<title>Nachhall 播放 · 快照拉正 + 1× 播放（手指辅助）</title>
+<title>Nachhall 播放（冻结频谱 · Griffin-Lim 逆STFT）</title>
 <style>
   :root{color-scheme:dark}
   html,body{margin:0;height:100%;background:#000;color:#fff;font-family:system-ui,-apple-system,Segoe UI}
@@ -21,57 +21,50 @@
 <div id="frame" class="white"></div>
 
 <script>
-/* ============ 固定规格（与你编码图的“规范坐标”一致即可） ============ */
-const CAN_W = 1024;         // 规范图宽（像素）
-const CAN_H = 640;          // 规范图高（像素）
-const TOP_MARGIN = 0;       // 若编码图顶端留了导引条，这里可设为其高度；没有就 0
-const SPEC_X = 0, SPEC_Y = TOP_MARGIN, SPEC_W = CAN_W, SPEC_H = CAN_H - TOP_MARGIN;
+/* ===== 规范图尺寸（与你的编码图要一致或等比抽样） ===== */
+const CAN_W = 1024, CAN_H = 640;
+const SPEC_X = 0, SPEC_Y = 0, SPEC_W = CAN_W, SPEC_H = CAN_H; // 你的频谱占满图就这样
 
-/* 下采样到的谱矩阵尺寸（越大越细，CPU 越高） */
-const C = 512;  // 列数（时间分辨）
-const K = 512;  // 频带数（频率分辨）
+/* ===== 逆STFT参数 ===== */
+const SR = 16000;            // 采样率
+const DUR = 3.0;             // 秒
+const NFFT = 1024;
+const HOP  = 128;
+const GL_ITERS = 24;         // Griffin-Lim 迭代次数（可调 24~48）
+const BINS = NFFT/2 + 1;
 
-/* 音频引擎参数 */
-const SR = 16000;  // 合成采样率
-const DUR = 3.0;   // 目标时长（秒），用于把列索引映射为时间
-
-/* ============ 相机启动 ============ */
+/* ===== 相机启动 ===== */
 const cam = document.getElementById('cam');
 const ui  = document.getElementById('ui');
 const frame = document.getElementById('frame');
-
 let capCv=null, capCtx=null;
+
 (async ()=>{
   try{
-    const s = await navigator.mediaDevices.getUserMedia({
-      video:{ facingMode:'environment', width:{ideal:1280}, height:{ideal:720} }
-    });
+    const s = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment', width:{ideal:1280}, height:{ideal:720}}});
     cam.srcObject = s; await cam.play();
     capCv = document.createElement('canvas');
     capCv.width  = cam.videoWidth  || 1280;
     capCv.height = cam.videoHeight || 720;
     capCtx = capCv.getContext('2d', {willReadFrequently:true});
     requestAnimationFrame(loop);
-  }catch(e){
-    alert('相机启动失败：请在 HTTPS 下并允许相机权限');
-  }
+  }catch(e){ alert('相机启动失败：请用 HTTPS 并允许相机权限'); }
 })();
 
-/* ============ 找黑框四角（简洁稳健版） ============ */
+/* ===== 工具：亮度、角块、单应、双线性采样 ===== */
 function grayAt(d,i){ return 0.2126*d[i]+0.7152*d[i+1]+0.0722*d[i+2]; }
+
 function findCorners(img,W,H){
-  const data=img.data, th = 90; // 黑色阈值（可按现场微调）
-  const w3=W/3|0, h3=H/3|0;
-  function bestIn(x0,y0, w,h){
+  const data=img.data, th=90; const w3=W/3|0, h3=H/3|0;
+  function bestIn(x0,y0,w,h){
     let best={area:0,cx:0,cy:0};
     for(let y=y0;y<y0+h;y+=2){
       for(let x=x0;x<x0+w;x+=2){
         const i=(y*W+x)*4, g=grayAt(data,i);
         if(g<th){
           let area=0, sx=0, sy=0;
-          const ww=10, hh=10;
-          for(let yy=y; yy<y+hh && yy<H; yy+=2)
-            for(let xx=x; xx<x+ww && xx<W; xx+=2){
+          for(let yy=y; yy<y+12 && yy<H; yy+=2)
+            for(let xx=x; xx<x+12 && xx<W; xx+=2){
               const ii=(yy*W+xx)*4; if(grayAt(data,ii)<th){ area++; sx+=xx; sy+=yy; }
             }
           if(area>best.area) best={area,cx:sx/area,cy:sy/area};
@@ -80,46 +73,42 @@ function findCorners(img,W,H){
     }
     return best.area? {x:best.cx,y:best.cy}: null;
   }
-  const tl=bestIn(0,0, w3,h3), tr=bestIn(W-w3,0, w3,h3),
-        bl=bestIn(0,H-h3, w3,h3), br=bestIn(W-w3,H-h3, w3,h3);
+  const tl=bestIn(0,0,w3,h3), tr=bestIn(W-w3,0,w3,h3),
+        bl=bestIn(0,H-h3,w3,h3), br=bestIn(W-w3,H-h3,w3,h3);
   if(tl&&tr&&bl&&br) return [tl,tr,bl,br];
   return null;
 }
 
-/* ============ 单应矫正（把相机帧拉到规范坐标） ============ */
-function getHomography(p){
+function solveHomography(p){
   const [tl,tr,bl,br]=p;
   const s=[tl.x,tl.y, tr.x,tr.y, bl.x,bl.y, br.x,br.y];
   const d=[0,0, CAN_W,0, 0,CAN_H, CAN_W,CAN_H];
-  function solveH(s,d){
-    const [x0,y0,x1,y1,x2,y2,x3,y3]=s, [X0,Y0,X1,Y1,X2,Y2,X3,Y3]=d;
-    const M=[
-      x0,y0,1, 0,0,0, -X0*x0,-X0*y0,
-      0,0,0, x0,y0,1, -Y0*x0,-Y0*y0,
-      x1,y1,1, 0,0,0, -X1*x1,-X1*y1,
-      0,0,0, x1,y1,1, -Y1*x1,-Y1*y1,
-      x2,y2,1, 0,0,0, -X2*x2,-X2*y2,
-      0,0,0, x2,y2,1, -Y2*x2,-Y2*y2,
-      x3,y3,1, 0,0,0, -X3*x3,-X3*y3,
-      0,0,0, x3,y3,1, -Y3*x3,-Y3*y3
-    ];
-    const B=[X0,Y0,X1,Y1,X2,Y2,X3,Y3];
-    const A=new Float64Array(64), bb=new Float64Array(8);
-    for(let i=0;i<64;i++) A[i]=M[i]; for(let i=0;i<8;i++) bb[i]=B[i];
-    for(let i=0;i<8;i++){
-      let piv=i, pv=Math.abs(A[i*8+i]);
-      for(let r=i+1;r<8;r++){ const v=Math.abs(A[r*8+i]); if(v>pv){pv=v;piv=r;} }
-      if(piv!==i){ for(let c=i;c<8;c++){ [A[i*8+c],A[piv*8+c]]=[A[piv*8+c],A[i*8+c]]; } [bb[i],bb[piv]]=[bb[piv],bb[i]]; }
-      const d=A[i*8+i]; for(let c=i;c<8;c++) A[i*8+c]/=d; bb[i]/=d;
-      for(let r=0;r<8;r++) if(r!==i){ const mul=A[r*8+i]; for(let c=i;c<8;c++) A[r*8+c]-=mul*A[i*8+c]; bb[r]-=mul*bb[i]; }
-    }
-    const h=new Float64Array(9); for(let i=0;i<8;i++) h[i]=bb[i]; h[8]=1; return h;
+  const [x0,y0,x1,y1,x2,y2,x3,y3]=s, [X0,Y0,X1,Y1,X2,Y2,X3,Y3]=d;
+  const M=[
+    x0,y0,1, 0,0,0, -X0*x0,-X0*y0,
+    0,0,0, x0,y0,1, -Y0*x0,-Y0*y0,
+    x1,y1,1, 0,0,0, -X1*x1,-X1*y1,
+    0,0,0, x1,y1,1, -Y1*x1,-Y1*y1,
+    x2,y2,1, 0,0,0, -X2*x2,-X2*y2,
+    0,0,0, x2,y2,1, -Y2*x2,-Y2*y2,
+    x3,y3,1, 0,0,0, -X3*x3,-X3*y3,
+    0,0,0, x3,y3,1, -Y3*x3,-Y3*y3
+  ];
+  const B=[X0,Y0,X1,Y1,X2,Y2,X3,Y3];
+  const A=new Float64Array(64), bb=new Float64Array(8);
+  for(let i=0;i<64;i++) A[i]=M[i]; for(let i=0;i<8;i++) bb[i]=B[i];
+  for(let i=0;i<8;i++){
+    let piv=i, pv=Math.abs(A[i*8+i]);
+    for(let r=i+1;r<8;r++){ const v=Math.abs(A[r*8+i]); if(v>pv){pv=v;piv=r;} }
+    if(piv!==i){ for(let c=i;c<8;c++){ [A[i*8+c],A[piv*8+c]]=[A[piv*8+c],A[i*8+c]]; } [bb[i],bb[piv]]=[bb[piv],bb[i]]; }
+    const d0=A[i*8+i]; for(let c=i;c<8;c++) A[i*8+c]/=d0; bb[i]/=d0;
+    for(let r=0;r<8;r++) if(r!==i){ const mul=A[r*8+i]; for(let c=i;c<8;c++) A[r*8+c]-=mul*A[i*8+c]; bb[r]-=mul*bb[i]; }
   }
-  return solveH(s,d);
+  const h=new Float64Array(9); for(let i=0;i<8;i++) h[i]=bb[i]; h[8]=1; return h;
 }
+
 function warpToCanonical(srcImg,W0,H0,Hm){
-  const d=new ImageData(CAN_W,CAN_H), dst=d.data, s=srcImg.data;
-  // 先求逆矩阵
+  const dst = new ImageData(CAN_W,CAN_H), d=dst.data, s=srcImg.data;
   const a=Hm, A=a[0],B=a[1],C=a[2],D=a[3],E=a[4],F=a[5],G=a[6],H=a[7],I=a[8];
   const det=A*(E*I-F*H)-B*(D*I-F*G)+C*(D*H-E*G);
   const inv=[
@@ -127,7 +116,7 @@ function warpToCanonical(srcImg,W0,H0,Hm){
     (F*G-D*I)/det, (A*I-C*G)/det, (C*D-A*F)/det,
     (D*H-E*G)/det, (B*G-A*H)/det, (A*E-B*D)/det
   ];
-  function sample(x,y){
+  function bilinear(x,y){
     const x0=Math.floor(x), y0=Math.floor(y), x1=Math.min(W0-1,x0+1), y1=Math.min(H0-1,y0+1);
     const a=x-x0, b=y-y0;
     const i00=(y0*W0+x0)*4, i10=(y0*W0+x1)*4, i01=(y1*W0+x0)*4, i11=(y1*W0+x1)*4;
@@ -142,177 +131,234 @@ function warpToCanonical(srcImg,W0,H0,Hm){
   for(let y=0;y<CAN_H;y++){
     for(let x=0;x<CAN_W;x++){
       const X=inv[0]*x+inv[1]*y+inv[2], Y=inv[3]*x+inv[4]*y+inv[5], Z=inv[6]*x+inv[7]*y+inv[8];
-      const sx=X/Z, sy=Y/Z;
-      const idx=(y*CAN_W+x)*4;
+      const sx=X/Z, sy=Y/Z, idx=(y*CAN_W+x)*4;
       if(sx>=0&&sx<W0&&sy>=0&&sy<H0){
-        const [r,g,b]=sample(sx,sy);
-        dst[idx]=r; dst[idx+1]=g; dst[idx+2]=b; dst[idx+3]=255;
-      }else{
-        dst[idx]=dst[idx+1]=dst[idx+2]=0; dst[idx+3]=255;
-      }
+        const [r,g,b]=bilinear(sx,sy);
+        d[idx]=r; d[idx+1]=g; d[idx+2]=b; d[idx+3]=255;
+      }else{ d[idx]=d[idx+1]=d[idx+2]=0; d[idx+3]=255; }
     }
   }
-  return d;
+  return dst;
 }
 
-/* ============ 从规范图提取谱矩阵（灰度→幅度，黑=强） ============ */
-function extractSpecMatrix(img){
+/* ===== 抽出幅度谱矩阵（灰→幅度，黑=强；做对比度拉伸+轻度高频衰减） ===== */
+function extractMagnitude(img){
   const data=img.data;
-  const cols=new Float32Array(C*K); // 按列存储，方便插值
-  // 估计对比度（10%/90% 分位），做线性拉伸
-  const samp=[]; for(let i=0;i<800;i++){ const x=(Math.random()*SPEC_W)|0, y=SPEC_Y + (Math.random()*SPEC_H)|0; const idx=(y*CAN_W+(SPEC_X+x))*4; const g=0.2126*data[idx]+0.7152*data[idx+1]+0.0722*data[idx+2]; samp.push(g); }
+  const frames = Math.floor((SR*DUR - NFFT)/HOP) + 1; // 目标列数
+  const mags = new Float32Array(frames*BINS);        // 按 [f*BINS + k]
+  // 对比度：10%/90% 分位
+  const samp=[]; for(let i=0;i<1200;i++){ const x=(Math.random()*SPEC_W)|0, y=SPEC_Y+(Math.random()*SPEC_H)|0; const idx=(y*CAN_W+(SPEC_X+x))*4; samp.push( grayAt(data,idx) ); }
   samp.sort((a,b)=>a-b); const p10=samp[(samp.length*0.10)|0], p90=samp[(samp.length*0.90)|0]; const denom=Math.max(8,p90-p10);
   const mapG = g => Math.max(0, Math.min(1, 1 - (g-p10)/denom)); // 黑→1
 
-  for(let cx=0; cx<C; cx++){
-    const x = SPEC_X + Math.round(cx*(SPEC_W-1)/(C-1));
-    for(let ky=0; ky<K; ky++){
-      const y = SPEC_Y + Math.round((SPEC_H-1) - ky*(SPEC_H-1)/(K-1));
-      const idx=(y*CAN_W+x)*4;
-      const g = 0.2126*data[idx]+0.7152*data[idx+1]+0.0722*data[idx+2];
-      let a = mapG(g);
-      // 轻度去“电子味”：给高频一点衰减
-      a *= 0.6 + 0.4*(ky/K);
-      cols[cx*K + ky] = a;
+  for(let f=0; f<frames; f++){
+    const x = SPEC_X + Math.round(f*(SPEC_W-1)/(frames-1));
+    for(let k=0; k<BINS; k++){
+      const y = SPEC_Y + Math.round((SPEC_H-1) - k*(SPEC_H-1)/(BINS-1));
+      const idx=(y*CAN_W + x)*4;
+      let a = mapG( grayAt(data,idx) );
+      // 抑制极高频的“电感”：给最高 1/4 频带一点衰减
+      const hf = k/(BINS-1);
+      a *= (hf<0.75)? 1.0 : (1.0 - (hf-0.75)/0.25*0.3);
+      mags[f*BINS + k] = a;
     }
   }
-  return {cols, C, K};
+  return {mags, frames};
 }
 
-/* ============ AudioWorklet：相位连续加法合成（1× 播放） ============ */
-let actx=null, node=null;
-async function ensureAudio(){
-  if(actx) return;
-  actx = new (window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
-  const code = `
-  class PV extends AudioWorkletProcessor{
-    constructor(){
-      super();
-      this.C=0; this.K=0; this.cols=null;
-      this.x=0; this.dx=0;      // 每样本前进的“列”数
-      this.f=null; this.phi=null;
-      this.gain=1.0;            // 总增益
-      this.port.onmessage = e=>{
-        const m=e.data;
-        if(m.t==='spec'){
-          this.C=m.C; this.K=m.K; this.cols=m.cols;
-          this.f=new Float32Array(this.K);
-          const ny = sampleRate/2;
-          for(let k=0;k<this.K;k++) this.f[k]=k*ny/(this.K-1);
-          this.phi=new Float32Array(this.K); this.phi.fill(0);
-        }else if(m.t==='state'){
-          this.x=m.x; this.dx=m.dx; this.gain=m.gain;
-        }
-      };
-    }
-    process(_, outs){
-      const out=outs[0][0]; out.fill(0);
-      if(!this.cols||!this.f) return true;
-      let x=this.x, dx=this.dx, C=this.C, K=this.K, phi=this.phi, f=this.f, cols=this.cols, g=this.gain;
-      for(let n=0;n<out.length;n++){
-        let s=0;
-        const c0 = Math.floor(x), a = x - c0, c1 = (c0+1<C)?(c0+1):c0;
-        const off0=c0*K, off1=c1*K;
-        for(let k=0;k<K;k++){
-          const A = cols[off0+k]*(1-a) + cols[off1+k]*a;
-          phi[k] += 2*Math.PI*f[k]/sampleRate;        // 相位连续推进
-          s += A * Math.sin(phi[k]);
-        }
-        out[n] = Math.tanh(s*0.35) * g;              // 软限幅
-        x += dx;
-        if(x<0) x=0; else if(x>C-1) x=C-1;           // 到边界就停
+/* ===== FFT / IFFT / Hann 窗 ===== */
+function hann(N){ const w=new Float32Array(N); for(let n=0;n<N;n++) w[n]=0.5*(1-Math.cos(2*Math.PI*n/(N-1))); return w; }
+function fftRadix2(re,im){
+  const N=re.length; let j=0;
+  for(let i=1;i<N-1;i++){ let bit=N>>1; for(; j & bit; bit>>=1) j^=bit; j^=bit; if(i<j){ [re[i],re[j]]=[re[j],re[i]]; [im[i],im[j]]=[im[j],im[i]]; } }
+  for(let len=2; len<=N; len<<=1){
+    const ang=-2*Math.PI/len, wlen_r=Math.cos(ang), wlen_i=Math.sin(ang);
+    for(let i=0;i<N;i+=len){
+      let wr=1, wi=0;
+      for(let k=0;k<len/2;k++){
+        const u_r=re[i+k], u_i=im[i+k];
+        const v_r=re[i+k+len/2]*wr - im[i+k+len/2]*wi;
+        const v_i=re[i+k+len/2]*wi + im[i+k+len/2]*wr;
+        re[i+k]=u_r+v_r; im[i+k]=u_i+v_i;
+        re[i+k+len/2]=u_r-v_r; im[i+k+len/2]=u_i-v_i;
+        const nwr=wr*wlen_r - wi*wlen_i, nwi=wr*wlen_i + wi*wlen_r; wr=nwr; wi=nwi;
       }
-      this.x=x; return true;
     }
   }
-  registerProcessor('pv', PV);
-  `;
-  const blob=new Blob([code],{type:'application/javascript'}), url=URL.createObjectURL(blob);
-  await actx.audioWorklet.addModule(url); URL.revokeObjectURL(url);
-  node=new AudioWorkletNode(actx,'pv',{numberOfInputs:0,numberOfOutputs:1,outputChannelCount:[1]});
-  node.connect(actx.destination);
+}
+function ifftRadix2(re,im){
+  for(let i=0;i<re.length;i++) im[i] = -im[i];
+  fftRadix2(re,im);
+  const N=re.length; for(let i=0;i<N;i++){ re[i]/=N; im[i]/=N; }
 }
 
-/* ============ 主循环：锁定→快照→抽谱→播放（1×），手指可随时落针/拖动 ============ */
-let frozen=null;            // ImageData of canonical
-let spec=null;              // {cols,C,K}
-let playing=false;
-let playhead=0;             // 0..C-1
-let lastT=0;
+/* ===== Griffin-Lim（幅度 → 时域）===== */
+function griffinLim(mags, frames){
+  const win=hann(NFFT), hop=HOP, bins=BINS;
+  // 初始化 S = mags * e^{j*phi}（随机相位）
+  const re=new Float32Array(NFFT), im=new Float32Array(NFFT);
+  let Sre=new Float32Array(frames*bins), Sim=new Float32Array(frames*bins);
+  for(let f=0; f<frames; f++){
+    for(let k=0;k<bins;k++){
+      const m = mags[f*bins+k];
+      const ph = Math.random()*2*Math.PI;
+      Sre[f*bins+k] = m*Math.cos(ph);
+      Sim[f*bins+k] = m*Math.sin(ph);
+    }
+  }
+  // 叠窗缓冲
+  const outLen = (frames-1)*hop + NFFT;
+  function istft_to_time(SR, SI){
+    const y = new Float32Array(outLen);
+    const wsum = new Float32Array(outLen);
+    const fr = new Float32Array(NFFT), fi = new Float32Array(NFFT);
+    for(let f=0; f<frames; f++){
+      // 组完整谱（共轭）
+      for(let k=0;k<bins;k++){ fr[k]=SR[f*bins+k]; fi[k]=SI[f*bins+k]; }
+      for(let k=bins;k<NFFT;k++){ const kk=NFFT-k; fr[k]=fr[kk]; fi[k]=-fi[kk]; }
+      ifftRadix2(fr,fi);
+      const off=f*hop;
+      for(let n=0;n<NFFT;n++){
+        const w=win[n], v=fr[n]*w;
+        y[off+n] += v;
+        wsum[off+n] += w*w;
+      }
+    }
+    // 窗平方归一
+    for(let i=0;i<outLen;i++){ const d=wsum[i]>1e-9? wsum[i]:1; y[i]/=d; }
+    return y;
+  }
+  function stft_from_time(x){
+    const SR2=new Float32Array(frames*bins), SI2=new Float32Array(frames*bins);
+    const fr=new Float32Array(NFFT), fi=new Float32Array(NFFT);
+    for(let f=0; f<frames; f++){
+      const off=f*hop;
+      for(let n=0;n<NFFT;n++){ fr[n]=(x[off+n]||0)*win[n]; fi[n]=0; }
+      fftRadix2(fr,fi);
+      for(let k=0;k<bins;k++){ SR2[f*bins+k]=fr[k]; SI2[f*bins+k]=fi[k]; }
+    }
+    return {SR2, SI2};
+  }
+  for(let it=0; it<GL_ITERS; it++){
+    // ISTFT
+    const y = istft_to_time(Sre, Sim);
+    // STFT
+    const {SR2, SI2} = stft_from_time(y);
+    // 替换幅度，保留相位
+    for(let i=0;i<frames*bins;i++){
+      const r=SR2[i], j=SI2[i], mag=Math.hypot(r,j);
+      if(mag>1e-8){ Sre[i] = mags[i]*r/mag; Sim[i] = mags[i]*j/mag; }
+      else{ Sre[i]=0; Sim[i]=0; }
+    }
+  }
+  // 最终 ISTFT
+  let y = (function(){ // 再做一次 ISTFT（用最终相位）
+    const fr=new Float32Array(NFFT), fi=new Float32Array(NFFT);
+    const out=new Float32Array(outLen), wsum=new Float32Array(outLen);
+    for(let f=0; f<frames; f++){
+      for(let k=0;k<bins;k++){ fr[k]=Sre[f*bins+k]; fi[k]=Sim[f*bins+k]; }
+      for(let k=bins;k<NFFT;k++){ const kk=NFFT-k; fr[k]=fr[kk]; fi[k]=-fi[kk]; }
+      ifftRadix2(fr,fi);
+      const off=f*hop;
+      for(let n=0;n<NFFT;n++){
+        const w=win[n], v=fr[n]*w;
+        out[off+n]+=v; wsum[off+n]+=w*w;
+      }
+    }
+    for(let i=0;i<outLen;i++){ const d=wsum[i]>1e-9?wsum[i]:1; out[i]/=d; }
+    return out;
+  })();
+  // 归一化（防削顶/防嗡鸣）：去直流 + 峰值限制到 0.98
+  let mean=0; for(let i=0;i<y.length;i++) mean+=y[i]; mean/=y.length;
+  for(let i=0;i<y.length;i++) y[i]-=mean;
+  let peak=1e-9; for(let i=0;i<y.length;i++) peak=Math.max(peak, Math.abs(y[i]));
+  const g=0.98/peak; for(let i=0;i<y.length;i++) y[i]*=g;
+  return y;
+}
 
+/* ===== AudioContext 播放控制（1× 正常速率；手指=快进/落针） ===== */
+let actx=null, source=null, buffer=null, startTime=0, startOffset=0, playing=false;
+async function ensureAudio(){ if(!actx) actx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:SR}); }
+function playFrom(offsetSec){
+  if(!buffer) return;
+  if(source){ try{source.stop();}catch(_){} source.disconnect(); }
+  source=actx.createBufferSource(); source.buffer=buffer; source.connect(actx.destination);
+  startTime=actx.currentTime; startOffset=Math.max(0, Math.min(buffer.duration, offsetSec||0));
+  source.start(0, startOffset);
+  playing=true;
+  source.onended = ()=>{ playing=false; }; // 播完即停，不会拖尾
+}
+function currentPlayhead(){ // 0..1
+  if(!buffer || !playing) return (startOffset||0)/(buffer.duration||1);
+  const t = (actx.currentTime - startTime) + startOffset;
+  return Math.max(0, Math.min(1, t/(buffer.duration||1)));
+}
+
+/* ===== 抽谱 → Griffin-Lim → AudioBuffer ===== */
+function makeBufferFromMagnitudes(mags, frames){
+  const y = griffinLim(mags, frames); // Float32Array
+  const buf = actx.createBuffer(1, y.length, SR);
+  buf.copyToChannel(y, 0, 0);
+  return buf;
+}
+
+/* ===== 主循环：锁定一次 → 冻结 → 抽谱 → GL → 播放 ===== */
+let frozen=null, mags=null, frames=0, building=false;
 function drawPlayhead(){
-  const ctx=ui.getContext('2d');
-  const rect=cam.getBoundingClientRect();
-  ui.width=innerWidth; ui.height=innerHeight;
-  ctx.clearRect(0,0,ui.width,ui.height);
-  if(!playing) return;
-  // 屏幕上的竖线（按规范坐标等比映射到 video 的可视区域）
-  const x = Math.round(rect.left + (playhead/(C-1))*rect.width);
+  const ctx=ui.getContext('2d'); const r=cam.getBoundingClientRect();
+  ui.width=innerWidth; ui.height=innerHeight; ctx.clearRect(0,0,ui.width,ui.height);
+  if(!buffer) return;
+  const u = currentPlayhead(); const x = Math.round(r.left + u*r.width);
   ctx.strokeStyle='rgba(255,255,255,.95)'; ctx.lineWidth=2;
-  ctx.beginPath(); ctx.moveTo(x, rect.top); ctx.lineTo(x, rect.bottom); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x, r.top); ctx.lineTo(x, r.bottom); ctx.stroke();
 }
-
 async function loop(){
   capCtx.drawImage(cam,0,0,capCv.width,capCv.height);
   const img=capCtx.getImageData(0,0,capCv.width,capCv.height);
-  if(!frozen){
-    const cs=findCorners(img, capCv.width, capCv.height);
+  if(!frozen && !building){
+    const cs = findCorners(img, capCv.width, capCv.height);
     if(cs){
       frame.className='green';
-      // 第一次稳定后马上“冻结”
-      const Hm=getHomography(cs);
+      // 立刻冻结
+      const Hm=solveHomography(cs);
       frozen = warpToCanonical(img, capCv.width, capCv.height, Hm);
-      // 提取谱矩阵
-      spec = extractSpecMatrix(frozen);
-      // 启动音频：1× 正常播放
-      await ensureAudio();
-      node.port.postMessage({t:'spec', C:spec.C, K:spec.K, cols:spec.cols});
-      const dx = (spec.C/DUR)/SR; // 每样本推进多少列 = (列/秒)/采样率
-      node.port.postMessage({t:'state', x:0, dx, gain:1.0});
-      playing=true; playhead=0; lastT=performance.now()*0.001;
+      building = true;
+      try{
+        const ex = extractMagnitude(frozen);
+        mags = ex.mags; frames = ex.frames;
+        await ensureAudio();
+        buffer = makeBufferFromMagnitudes(mags, frames);
+        playFrom(0); // 1× 播放
+      }catch(e){
+        console.error(e); alert('重建失败：'+e.message);
+      }finally{
+        building=false;
+      }
     }else{
       frame.className='white';
-    }
-  }else{
-    // 已冻结：只画 UI（相机画面保留作背景）
-    if(playing){
-      // 依据时钟推进本地 playhead（1×）
-      const t=performance.now()*0.001, dt=t-lastT; lastT=t;
-      playhead += (spec.C/DUR)*dt; if(playhead>=spec.C) playhead=spec.C-1; // 到边界停（或你想循环也行）
-      node.port.postMessage({t:'state', x:playhead, dx:(spec.C/DUR)/SR, gain:1.0});
     }
   }
   drawPlayhead();
   requestAnimationFrame(loop);
 }
 
-/* ============ 触摸手势：落针/拖动（辅助 1×，不改时钟） ============ */
-let dragging=false;
-function pointerToCol(ev){
-  const r=cam.getBoundingClientRect();
-  const x=ev.clientX;
-  const u = (x - r.left) / r.width; // 0..1
-  return Math.max(0, Math.min(spec? (spec.C-1):0, Math.round(u*(spec.C-1))));
+/* ===== 手指=落针/拖动（不改音高，只改播放位置） ===== */
+function pointerToU(ev){
+  const r=cam.getBoundingClientRect(); const u = (ev.clientX - r.left) / r.width;
+  return Math.max(0, Math.min(1, u));
 }
+let dragging=false;
 window.addEventListener('pointerdown', ev=>{
-  if(!spec) return;
-  dragging=true;
-  playhead = pointerToCol(ev);
-  if(node) node.port.postMessage({t:'state', x:playhead, dx:(spec.C/DUR)/SR, gain:1.0});
-  // 如需“按住才有声，松手就静音”，把下面两行的注释对调：
-  // playing=true; 
-  // node.port.postMessage({t:'state', x:playhead, dx:0, gain:1.0}); // 选择“按住 = 暂停时钟，只听你拖动的位置”
+  if(!buffer) return;
+  dragging=true; ensureAudio();
+  const u = pointerToU(ev); playFrom(u*buffer.duration);
 });
 window.addEventListener('pointermove', ev=>{
-  if(!dragging||!spec) return;
-  playhead = pointerToCol(ev);
-  if(node) node.port.postMessage({t:'state', x:playhead, dx:(spec.C/DUR)/SR, gain:1.0});
+  if(!buffer || !dragging) return;
+  const u = pointerToU(ev); playFrom(u*buffer.duration);
 });
-window.addEventListener('pointerup', ev=>{
-  dragging=false;
-  // 如需“松手=静音”，在这里把 gain 设 0 或 dx 设 0；默认继续 1× 播放：
-  // if(node) node.port.postMessage({t:'state', x:playhead, dx:0, gain:0});
-});
+window.addEventListener('pointerup', ()=>{ dragging=false; });
+
 </script>
 </body>
 </html>
