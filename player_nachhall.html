@@ -3,20 +3,20 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-<title>Nachhall 播放 · 数字条带（RS 纠错 + IMA-ADPCM）</title>
+<title>Nachhall 播放 · 数字条带（严格锁定 + RS + ADPCM）</title>
 <style>
-  :root{color-scheme:dark}
-  html,body{margin:0;height:100%;background:#000;color:#fff;font-family:system-ui,-apple-system,Segoe UI}
-  #stage{position:fixed;inset:0;display:grid;place-items:center}
-  video{max-width:100vw;max-height:100vh;display:block;opacity:.98}
-  #ui{position:fixed;inset:0;pointer-events:none}
-  #frame{position:fixed;inset:0;pointer-events:none}
-  .white{box-shadow:0 0 0 3px rgba(255,255,255,.6) inset}
-  .green{box-shadow:0 0 0 4px rgba(0,255,170,.95) inset}
-  #unlock{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
-          background:rgba(0,0,0,.55);backdrop-filter:blur(2px);cursor:pointer}
-  #unlock button{font-size:18px;padding:12px 18px;border-radius:12px;border:1px solid #9cf;background:#101b; color:#fff}
-  #log{position:fixed;left:8px;top:8px;font:12px ui-monospace,Menlo,Consolas;color:#9cf;white-space:pre;pointer-events:none}
+  :root{ color-scheme: dark }
+  html,body{ margin:0; height:100%; background:#000; color:#fff; font-family:system-ui,-apple-system,Segoe UI }
+  #stage{ position:fixed; inset:0; display:grid; place-items:center }
+  video{ max-width:100vw; max-height:100vh; display:block; opacity:.98 }
+  #ui{ position:fixed; inset:0; pointer-events:none }
+  #frame{ position:fixed; inset:0; pointer-events:none }
+  .white{ box-shadow:0 0 0 3px rgba(255,255,255,.6) inset }
+  .green{ box-shadow:0 0 0 4px rgba(0,255,170,.95) inset }
+  #unlock{ position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+           background:rgba(0,0,0,.55); backdrop-filter:blur(2px); cursor:pointer }
+  #unlock button{ font-size:18px; padding:12px 18px; border-radius:12px; border:1px solid #9cf; background:#101b; color:#fff }
+  #log{ position:fixed; left:8px; top:8px; font:12px ui-monospace,Menlo,Consolas; color:#9cf; white-space:pre; pointer-events:none }
 </style>
 </head>
 <body>
@@ -27,73 +27,81 @@
 <div id="log"></div>
 
 <script>
-/* ====== 与编码页匹配的版面参数 ====== */
+/* ===== 固定与编码页匹配的版面参数 ===== */
 const PAGE_W=1240, PAGE_H=1754, MARGIN=60, CELL=6, COLS=160, ROWS=200;
 const GX = MARGIN+20, GY = MARGIN+80; // 网格左上
 const GW = COLS*CELL, GH = ROWS*CELL;
 
-/* ====== 工具 ====== */
-const log = s => document.getElementById('log').textContent=s;
+/* ===== 相机与UI ===== */
+const cam = $('#cam'), ui=$('#ui'), frame=$('#frame'), unlock=$('#unlock'), logbox=$('#log');
+let capCv=null, capCtx=null;
+function $(s){ return document.querySelector(s); }
+function log(s){ logbox.textContent=s; }
+
+/* ===== 小工具 ===== */
 function grayAt(d,i){ return 0.2126*d[i]+0.7152*d[i+1]+0.0722*d[i+2]; }
-function u16leFrom(dv,off){ return dv.getUint16(off,true); }
-function u32leFrom(dv,off){ return dv.getUint32(off,true); }
+function clamp01(x){ return x<0?0:(x>1?1:x); }
+function bitsToBytes(bits){ const n=Math.ceil(bits.length/8), out=new Uint8Array(n); for(let i=0;i<bits.length;i++){ const bi=i>>3, bp=7-(i&7); out[bi]|=(bits[i]&1)<<bp; } return out; }
+function concatU8(...arrs){ let L=0; for(const a of arrs) L+=a.length; const out=new Uint8Array(L); let o=0; for(const a of arrs){ out.set(a,o); o+=a.length; } return out; }
 const CRC_TABLE = (()=>{ const t=new Uint32Array(256); for(let i=0;i<256;i++){ let c=i; for(let j=0;j<8;j++) c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1); t[i]=c>>>0; } return t; })();
 function crc32(bytes){ let c=0xFFFFFFFF; for(let i=0;i<bytes.length;i++) c=CRC_TABLE[(c^bytes[i])&0xff]^(c>>>8); return (c^0xFFFFFFFF)>>>0; }
-function bitsToBytes(bits){ const n=Math.ceil(bits.length/8), out=new Uint8Array(n); for(let i=0;i<bits.length;i++){ const bi=i>>3, bp=7-(i&7); out[bi]|=(bits[i]&1)<<bp; } return out; }
-function bytesToBits(bytes){ const bits=new Uint8Array(bytes.length*8); let k=0; for(let i=0;i<bytes.length;i++){ const v=bytes[i]; for(let b=7;b>=0;b--) bits[k++]=(v>>b)&1; } return bits; }
 
-/* ====== IMA-ADPCM 解码 ====== */
-const IMA_STEP = new Int16Array([7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,60,66,73,80,88,97,107,118,130,143,157,173,190,209,230,253,279,307,337,371,408,449,494,544,598,658,724,796,876,963,1060,1166,1282,1411,1552,1707,1878,2066,2272,2499,2749,3024,3327,3660,4026,4428,4871,5358,5894,6484,7132,7845,8630,9493,10442,11487,12635,13899,15289,16818,18500,20350,22385,24623,27086,29794,32767]);
-const IMA_IDX = new Int8Array([-1,-1,-1,-1,2,4,6,8,-1,-1,-1,-1,2,4,6,8]);
-function imaDecode(adpcm, sampleCount){
-  let index=0, pred=0; const out=new Int16Array(sampleCount); let oi=0;
-  for(let i=0;i<adpcm.length;i++){
-    const byte=adpcm[i];
-    for(let t=0;t<2 && oi<sampleCount; t++){
-      const code = (t===0)? ((byte>>4)&0x0F) : (byte&0x0F);
-      let step=IMA_STEP[index], vpdiff=step>>3;
-      if(code&1) vpdiff+=step>>2; if(code&2) vpdiff+=step>>1; if(code&4) vpdiff+=step;
-      pred = (code&8)? (pred - vpdiff) : (pred + vpdiff);
-      if(pred>32767) pred=32767; if(pred<-32768) pred=-32768;
-      index += IMA_IDX[code]; if(index<0) index=0; if(index>88) index=88;
-      out[oi++]=pred;
+/* ===== 角块粗检（帧内） ===== */
+function findCornerCandidates(img,W,H){
+  const data=img.data;
+  // 估阈值（全帧10/90分位）
+  const samp=[]; for(let i=0;i<800;i++){ const x=(Math.random()*W)|0, y=(Math.random()*H)|0; const idx=(y*W+x)*4; samp.push(grayAt(data,idx)); }
+  samp.sort((a,b)=>a-b); const p10=samp[(samp.length*0.10)|0], p90=samp[(samp.length*0.90)|0];
+  const th = (p10 + p90)/2;
+
+  // 在四个象限搜黑色连片的“近似方块重心 + 估计尺寸”
+  function best(x0,y0, x1,y1){
+    let best=null;
+    const step = 4;
+    for(let y=y0; y<y1; y+=step){
+      for(let x=x0; x<x1; x+=step){
+        const idx=(y*W+x)*4; if(grayAt(data,idx)>=th) continue;
+        // 探 24x24 窗统计“黑像素比例”和“宽高近似”
+        let cnt=0, sx=0, sy=0, black=0;
+        const WW=24, HH=24;
+        for(let yy=0; yy<HH; yy+=2){
+          const yy0=y+yy; if(yy0>=H) break;
+          for(let xx=0; xx<WW; xx+=2){
+            const xx0=x+xx; if(xx0>=W) break;
+            const ii=(yy0*W+xx0)*4; const g=grayAt(data,ii); cnt++; if(g<th){ black++; sx+=xx0; sy+=yy0; }
+          }
+        }
+        const ratio = black / Math.max(1,cnt);
+        if(ratio>0.55){ // 足够黑
+          const cx=sx/Math.max(1,black), cy=sy/Math.max(1,black);
+          const cand={x:cx,y:cy, score:ratio};
+          if(!best || cand.score>best.score) best=cand;
+        }
+      }
     }
+    return best;
   }
-  return out;
+  const tl=best(0,0, W*0.35|0, H*0.35|0);
+  const tr=best(W*0.65|0,0, W, H*0.35|0);
+  const bl=best(0,H*0.65|0, W*0.35|0, H);
+  const br=best(W*0.65|0,H*0.65|0, W, H);
+  if(!(tl&&tr&&bl&&br)) return null;
+
+  // 几何检查：长宽比≈A4（~1:1.414），对角距离相近
+  const dx1=tr.x-tl.x, dy1=tr.y-tl.y, dx2=bl.x-tl.x, dy2=bl.y-tl.y;
+  const w = Math.hypot(dx1,dy1), h = Math.hypot(dx2,dy2);
+  if(w<50||h<50) return null;
+  const ratio = w/h;
+  if(ratio<0.6 || ratio>1.0) return null; // 竖版A4在相机里 w/h 一般 0.65~0.8 左右（保守）
+
+  return [tl,tr,bl,br];
 }
 
-/* ====== RS(255,223) 纠错（GF(256), 0x11d） ====== */
-const gfExp=new Uint16Array(512), gfLog=new Uint16Array(256);
-(function initGF(){ let x=1; for(let i=0;i<255;i++){ gfExp[i]=x; gfLog[x]=i; x<<=1; if(x&0x100) x^=0x11d; } for(let i=255;i<512;i++) gfExp[i]=gfExp[i-255]; })();
-function gfAdd(a,b){ return a^b; }
-function gfMul(a,b){ if(a===0||b===0) return 0; return gfExp[(gfLog[a]+gfLog[b])%255]; }
-function gfDiv(a,b){ if(b===0) throw Error('div0'); if(a===0) return 0; return gfExp[(gfLog[a]+255-gfLog[b])%255]; }
-function rsSyndromes(block, t=32){
-  const syn=new Uint8Array(t);
-  for(let i=0;i<t;i++){
-    let acc=0;
-    for(let j=0;j<block.length;j++){
-      acc = gfAdd(acc, gfMul(block[j], gfExp((i*(j))%255)) );
-    }
-    syn[i]=acc;
-  }
-  return syn;
-}
-function rsCorrect255_223(block){ // 尝试纠错，返回纠错后的 255 字节；失败则返回 null
-  // 这里采用简单“若综合为全 0，则视为无错；若非 0，则暂不做 Chien 搜索/Forney，直接返回原块”
-  // （工程上可替换为完整版纠错；实际打印+相机条件下，多数错误靠冗余/阈值即可通过）
-  const syn = rsSyndromes(block,32);
-  let allZero=true; for(const s of syn) if(s!==0){ allZero=false; break; }
-  if(allZero) return block;
-  // 简化：不做定位，直接返回 null 让上层判定是否可接受（多数帧在自适应阈值下能正确读出）
-  return null;
-}
-
-/* ====== 透视矫正 ====== */
-function solveHomography(p){ // p: tl,tr,bl,br
-  const [tl,tr,bl,br]=p;
-  const s=[tl.x,tl.y,tr.x,tr.y,bl.x,bl.y,br.x,br.y];
-  const d=[0,0,PAGE_W,0,0,PAGE_H,PAGE_W,PAGE_H];
+/* ===== 单应变换（到页面坐标） + 二次角块复核 ===== */
+function solveHomography(c){
+  const [tl,tr,bl,br]=c;
+  const s=[tl.x,tl.y, tr.x,tr.y, bl.x,bl.y, br.x,br.y];
+  const d=[0,0, PAGE_W,0, 0,PAGE_H, PAGE_W,PAGE_H];
   const [x0,y0,x1,y1,x2,y2,x3,y3]=s, [X0,Y0,X1,Y1,X2,Y2,X3,Y3]=d;
   const M=[
     x0,y0,1,0,0,0,-X0*x0,-X0*y0,
@@ -130,10 +138,8 @@ function warpToPage(srcImg,W0,H0,Hm){
     const x0=Math.floor(x), y0=Math.floor(y), x1=Math.min(W0-1,x0+1), y1=Math.min(H0-1,y0+1);
     const a=x-x0, b=y-y0;
     const i00=(y0*W0+x0)*4, i10=(y0*W0+x1)*4, i01=(y1*W0+x0)*4, i11=(y1*W0+x1)*4;
-    const r00=s[i00],g00=s[i00+1],b00=s[i00+2];
-    const r10=s[i10],g10=s[i10+1],b10=s[i10+2];
-    const r01=s[i01],g01=s[i01+1],b01=s[i01+2];
-    const r11=s[i11],g11=s[i11+1],b11=s[i11+2];
+    const r00=s[i00],g00=s[i00+1],b00=s[i00+2], r10=s[i10],g10=s[i10+1],b10=s[i10+2];
+    const r01=s[i01],g01=s[i01+1],b01=s[i01+2], r11=s[i11],g11=s[i11+1],b11=s[i11+2];
     const r0=r00*(1-a)+r10*a, g0=g00*(1-a)+g10*a, b0=b00*(1-a)+b10*a;
     const r1=r01*(1-a)+r11*a, g1=g01*(1-a)+g11*a, b1=b01*(1-a)+b11*a;
     return [ r0*(1-b)+r1*b, g0*(1-b)+g1*b, b0*(1-b)+b1*b ];
@@ -150,41 +156,34 @@ function warpToPage(srcImg,W0,H0,Hm){
   }
   return dst;
 }
-
-/* ====== 角块检测（四角最大黑块重心） ====== */
-function findCorners(img,W,H){
-  const data=img.data, th=90, w3=W/3|0, h3=H/3|0;
-  function best(x0,y0,w,h){
-    let best={area:0,cx:0,cy:0};
-    for(let y=y0;y<y0+h;y+=2){
-      for(let x=x0;x<x0+w;x+=2){
-        const i=(y*W+x)*4, g=grayAt(data,i);
-        if(g<th){
-          let area=0, sx=0, sy=0;
-          for(let yy=y; yy<y+12 && yy<H; yy+=2)
-            for(let xx=x; xx<x+12 && xx<W; xx+=2){
-              const ii=(yy*W+xx)*4; if(grayAt(data,ii)<th){ area++; sx+=xx; sy+=yy; }
-            }
-          if(area>best.area) best={area,cx:sx/area,cy:sy/area};
-        }
-      }
-    }
-    return best.area? {x:best.cx,y:best.cy}: null;
+function verifyPageCorners(pageImg){
+  // 在四角 S=36 黑块区域内采样应当“非常黑”
+  const S=36, data=pageImg.data, W=PAGE_W;
+  function meanGray(x0,y0,S){
+    let s=0,n=0;
+    for(let y=y0;y<y0+S;y+=2)
+      for(let x=x0;x<x0+S;x+=2){ const idx=(y*W+x)*4; s+=grayAt(data,idx); n++; }
+    return s/Math.max(1,n);
   }
-  const tl=best(0,0,w3,h3), tr=best(W-w3,0,w3,h3), bl=best(0,H-h3,w3,h3), br=best(W-w3,H-h3,w3,h3);
-  if(tl&&tr&&bl&&br) return [tl,tr,bl,br];
-  return null;
+  const mTL = meanGray(MARGIN-2, MARGIN-2, S);
+  const mTR = meanGray(PAGE_W-MARGIN-S+2, MARGIN-2, S);
+  const mBL = meanGray(MARGIN-2, PAGE_H-MARGIN-S+2, S);
+  const mBR = meanGray(PAGE_W-MARGIN-S+2, PAGE_H-MARGIN-S+2, S);
+  // 与页面整体阈值比较
+  const samp=[]; for(let i=0;i<1200;i++){ const x=(Math.random()*PAGE_W)|0, y=(Math.random()*PAGE_H)|0; const idx=(y*PAGE_W+x)*4; samp.push(grayAt(data,idx)); }
+  samp.sort((a,b)=>a-b); const p10=samp[(samp.length*0.10)|0], p90=samp[(samp.length*0.90)|0];
+  const th = (p10+p90)/2;
+  const ok = (mTL<th*0.9)&&(mTR<th*0.9)&&(mBL<th*0.9)&&(mBR<th*0.9);
+  return ok;
 }
 
-/* ====== 自适应二值化 + 按蛇形采样位 ====== */
+/* ===== 自适应二值化 + 按蛇形采样位 ===== */
 function readBitsFromPage(pageImg){
   const d=pageImg.data;
-  // 在网格区域估计 10%/90% 分位做阈值
   const samp=[]; for(let i=0;i<2000;i++){ const x=GX + (Math.random()*GW)|0, y=GY + (Math.random()*GH)|0; const idx=(y*PAGE_W+x)*4; samp.push(grayAt(d,idx)); }
   samp.sort((a,b)=>a-b); const p10=samp[(samp.length*0.10)|0], p90=samp[(samp.length*0.90)|0]; const th=(p10+p90)/2;
 
-  const bits=new Uint8Array(COLS*ROWS);
-  let k=0;
+  const bits=new Uint8Array(COLS*ROWS); let k=0;
   for(let r=0;r<ROWS;r++){
     const yy = GY + r*CELL + (CELL>>1);
     const dirRight = (r%2===0);
@@ -199,15 +198,52 @@ function readBitsFromPage(pageImg){
   return bits;
 }
 
-/* ====== 相机 / 播放控制 ====== */
-const cam = document.getElementById('cam'), ui=document.getElementById('ui'), frame=document.getElementById('frame');
-let capCv=null, capCtx=null, actx=null, buffer=null, source=null, startTime=0, startOffset=0, playing=false, unlocked=false;
+/* ===== RS(255,223) 基元（综合检测） ===== */
+const gfExp=new Uint16Array(512), gfLog=new Uint16Array(256);
+(function initGF(){ let x=1; for(let i=0;i<255;i++){ gfExp[i]=x; gfLog[x]=i; x<<=1; if(x&0x100) x^=0x11d; } for(let i=255;i<512;i++) gfExp[i]=gfExp[i-255]; })();
+function gfAdd(a,b){ return a^b; }
+function gfMul(a,b){ if(a===0||b===0) return 0; return gfExp[(gfLog[a]+gfLog[b])%255]; }
+function rsSyndromes(block,t=32){
+  const syn=new Uint8Array(t);
+  for(let i=0;i<t;i++){
+    let acc=0;
+    for(let j=0;j<block.length;j++){
+      // 评价点 α^{i}
+      const pow = (i*j)%255;
+      acc = gfAdd(acc, gfMul(block[j], gfExp[pow]));
+    }
+    syn[i]=acc;
+  }
+  return syn;
+}
 
+/* ===== IMA-ADPCM 解码 ===== */
+const IMA_STEP = new Int16Array([7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,60,66,73,80,88,97,107,118,130,143,157,173,190,209,230,253,279,307,337,371,408,449,494,544,598,658,724,796,876,963,1060,1166,1282,1411,1552,1707,1878,2066,2272,2499,2749,3024,3327,3660,4026,4428,4871,5358,5894,6484,7132,7845,8630,9493,10442,11487,12635,13899,15289,16818,18500,20350,22385,24623,27086,29794,32767]);
+const IMA_IDX = new Int8Array([-1,-1,-1,-1,2,4,6,8,-1,-1,-1,-1,2,4,6,8]);
+function imaDecode(adpcm, sampleCount){
+  let index=0, pred=0; const out=new Int16Array(sampleCount); let oi=0;
+  for(let i=0;i<adpcm.length;i++){
+    const byte=adpcm[i];
+    for(let t=0;t<2 && oi<sampleCount; t++){
+      const code = (t===0)? ((byte>>4)&0x0F) : (byte&0x0F);
+      let step=IMA_STEP[index], vpdiff=step>>3;
+      if(code&1) vpdiff+=step>>2; if(code&2) vpdiff+=step>>1; if(code&4) vpdiff+=step;
+      pred = (code&8)? (pred - vpdiff) : (pred + vpdiff);
+      if(pred>32767) pred=32767; if(pred<-32768) pred=-32768;
+      index += IMA_IDX[code]; if(index<0) index=0; if(index>88) index=88;
+      out[oi++]=pred;
+    }
+  }
+  return out;
+}
+
+/* ===== 音频上下文与播放 ===== */
+let actx=null, buffer=null, source=null, startTime=0, startOffset=0, playing=false, unlocked=false;
 async function ensureAudio(){
   if(!actx) actx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:8000});
-  if(actx.state!=='running'){ try{ await actx.resume(); }catch(_){} }
+  if(actx.state!=='running'){ try{ await actx.resume(); }catch(_){ } }
   unlocked = (actx.state==='running');
-  document.getElementById('unlock').style.display = unlocked? 'none':'flex';
+  $('#unlock').style.display = unlocked? 'none':'flex';
   return unlocked;
 }
 function playFrom(offsetSec){
@@ -221,7 +257,7 @@ function playFrom(offsetSec){
 function currentU(){
   if(!buffer || !playing) return (startOffset||0)/(buffer.duration||1);
   const t=(actx.currentTime - startTime) + startOffset;
-  return Math.max(0, Math.min(1, t/(buffer.duration||1)));
+  return clamp01(t/(buffer.duration||1));
 }
 function drawUI(){
   ui.width=innerWidth; ui.height=innerHeight;
@@ -232,107 +268,108 @@ function drawUI(){
   ctx.beginPath(); ctx.moveTo(x, r.top); ctx.lineTo(x, r.bottom); ctx.stroke();
 }
 
-/* ====== 主循环：锁定→透视矫正→读 bit→拼块→解码播放 ====== */
+/* ===== 主循环：严格锁定 → 拉正 → 角块复核 → 读码 → RS 合理性 → 容器校验 → 解码播放 ===== */
 let frozen=false;
 async function loop(){
   capCtx.drawImage(cam,0,0,capCv.width,capCv.height);
   const img=capCtx.getImageData(0,0,capCv.width,capCv.height);
   if(!frozen){
-    const cs=findCorners(img, capCv.width, capCv.height);
+    const cs = findCornerCandidates(img, capCv.width, capCv.height);
     if(cs){
+      // 先显示白到绿的过渡（但还未最终确定）
       frame.className='green';
-      const Hm=solveHomography(cs);
+      const Hm = solveHomography(cs);
       const page = warpToPage(img, capCv.width, capCv.height, Hm);
+      // 二次角块复核
+      if(!verifyPageCorners(page)){ frame.className='white'; log('角块复核失败，请对齐整页'); requestAnimationFrame(loop); drawUI(); return; }
+
       // 读 bit
       const bits = readBitsFromPage(page);
-      // 组字节流
       const bytes = bitsToBytes(bits);
-      // 255 字节为一块
+      // 分块
       const blocks=[]; for(let off=0; off+255<=bytes.length; off+=255){ blocks.push(bytes.slice(off, off+255)); }
-      // 第一块必须能解析出 meta + 起始数据
-      if(blocks.length===0){ log("读取失败：无有效块"); requestAnimationFrame(loop); drawUI(); return; }
+      if(blocks.length===0){ frame.className='white'; log('读取失败：无块'); requestAnimationFrame(loop); drawUI(); return; }
 
-      // 纠错/容错（简化：若某块 syndromes!=0 则丢弃该块；实践中阈值+稳定拍摄足够）
+      // 统计综合为 0 的块
       const okBlocks=[];
       for(const b of blocks){
-        const syn = rsSyndromes(b,32); let allZero=true; for(const s of syn) if(s!==0){allZero=false;break;}
+        const syn = rsSyndromes(b,32);
+        let allZero=true; for(const s of syn) if(s!==0){ allZero=false; break; }
         if(allZero) okBlocks.push(b);
       }
-      if(okBlocks.length===0){ log("读取失败：全部块综合非零"); requestAnimationFrame(loop); drawUI(); return; }
+      if(okBlocks.length===0){ frame.className='white'; log('读取失败：RS综合失败'); requestAnimationFrame(loop); drawUI(); return; }
 
-      // 拼数据（每块的前 223 字节是数据）
-      const dataBytes = concatUint8(...okBlocks.map(b=>b.slice(0,223)));
+      // 拼数据（每块前 223字节）
+      const dataBytes = concatU8(...okBlocks.map(b=>b.slice(0,223)));
       // meta
-      const meta = dataBytes.slice(0,8);
-      const dv = new DataView(meta.buffer, meta.byteOffset, meta.byteLength);
-      const totalBlocks = u16leFrom(dv,0);
-      const crcAll = u32leFrom(dv,2);
-      const dataLenLow = u16leFrom(dv,6);
+      if(dataBytes.length<8){ frame.className='white'; log('meta 不足'); requestAnimationFrame(loop); drawUI(); return; }
+      const dv = new DataView(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength);
+      const totalBlocks = dv.getUint16(0,true);
+      const crcAll = dv.getUint32(2,true);
+      const dataLenLow = dv.getUint16(6,true); // 仅参考
 
-      // 合理性检查
-      if(totalBlocks<1 || okBlocks.length<1){ log("读取失败：meta 异常"); requestAnimationFrame(loop); drawUI(); return; }
+      // 拼到宣称长度（但以容器校验为准）
+      const expectLen = 8 + totalBlocks*223;
+      const payloadAll = dataBytes.slice(8, Math.min(dataBytes.length, expectLen));
 
-      // 拼到标称长度（按 totalBlocks*223，但以 CRC 为准）
-      const payloadAll = dataBytes.slice(8, 8 + totalBlocks*223);
-      // 去除可能的尾部 padding：需要容器头校验
-      // 容器头部： "APG2"(4)+sr(u16)+nSamples(u32)+codec(u8)+rsv(u8)+payLen(u32)+crc32(u32)
-      if(payloadAll.length < 4+2+4+1+1+4+4){ log("读取失败：容器头不足"); requestAnimationFrame(loop); drawUI(); return; }
+      // 容器头部校验
+      if(payloadAll.length < 20){ frame.className='white'; log('容器头不足'); requestAnimationFrame(loop); drawUI(); return; }
       const magic = new TextDecoder().decode(payloadAll.slice(0,4));
-      if(magic!=="APG2"){ log("读取失败：Magic 错误"); requestAnimationFrame(loop); drawUI(); return; }
+      if(magic!=='APG2'){ frame.className='white'; log('Magic 错误'); requestAnimationFrame(loop); drawUI(); return; }
       const dv2=new DataView(payloadAll.buffer, payloadAll.byteOffset, payloadAll.byteLength);
-      const sr=dv2.getUint16(4,true), nSam=dv2.getUint32(6,true), codec=dv2.getUint8(10), payL=dv2.getUint32(12,true), chk=dv2.getUint32(16,true);
-      const off=20;
-      if(off+payL>payloadAll.length){ log("读取失败：payload 越界"); requestAnimationFrame(loop); drawUI(); return; }
+      const sr = dv2.getUint16(4,true), nSam=dv2.getUint32(6,true), codec=dv2.getUint8(10), payL=dv2.getUint32(12,true), chk=dv2.getUint32(16,true);
+      if(codec!==1||sr!==8000){ frame.className='white'; log(`容器参数不符 codec=${codec} sr=${sr}`); requestAnimationFrame(loop); drawUI(); return; }
+      const off=20; if(off+payL>payloadAll.length){ frame.className='white'; log('payload 越界'); requestAnimationFrame(loop); drawUI(); return; }
       const adpcm = payloadAll.slice(off, off+payL);
-      if( (crc32(adpcm)>>>0) !== (chk>>>0) ){ log("读取失败：ADPCM CRC 不符"); requestAnimationFrame(loop); drawUI(); return; }
+      if( (crc32(adpcm)>>>0)!==(chk>>>0) ){ frame.className='white'; log('ADPCM CRC 不符'); requestAnimationFrame(loop); drawUI(); return; }
 
-      // 解码 ADPCM → Float32
+      // 解码并播放
       await ensureAudio();
+      if(!unlocked){ log('需要点一下解锁声音'); frame.className='green'; requestAnimationFrame(loop); drawUI(); return; }
+
       const pcm16 = imaDecode(adpcm, nSam);
-      const buf = actx.createBuffer(1, nSam, sr);
-      const ch0 = buf.getChannelData(0);
-      for(let i=0;i<nSam;i++) ch0[i]=Math.max(-1, Math.min(1, pcm16[i]/32768));
-      buffer = buf; playFrom(0);
+      buffer = actx.createBuffer(1, nSam, sr);
+      buffer.copyToChannel(Float32Array.from(pcm16, v=>Math.max(-1, Math.min(1, v/32768))), 0, 0);
+      playFrom(0);
       log(`解码成功：sr=${sr} n=${nSam}（≈ ${(nSam/sr).toFixed(2)} s），OK块=${okBlocks.length}/${blocks.length}`);
-      frozen=true; // 成功后“冻结”，不再重读
+      frozen=true; // 成功后冻结
     }else{
       frame.className='white';
-      log('请把整页置于取景器内（出现绿色边框即锁定）');
+      log('请把整页置于取景器内（四角黑块都入框）');
     }
   }
   drawUI();
   requestAnimationFrame(loop);
 }
-function concatUint8(...arrs){ let L=0; for(const a of arrs) L+=a.length; const out=new Uint8Array(L); let o=0; for(const a of arrs){ out.set(a,o); o+=a.length; } return out; }
 
-/* ====== 触摸：落针/快进 ====== */
+/* ===== 触摸：落针/快进 ===== */
 function pointerU(ev){
   const r=cam.getBoundingClientRect();
-  return Math.max(0, Math.min(1, (ev.clientX - r.left)/r.width ));
+  return clamp01( (ev.clientX - r.left)/r.width );
 }
 let dragging=false;
 window.addEventListener('pointerdown', async ev=>{
   if(!await ensureAudio()) return;
-  if(buffer){ dragging=true; const u=pointerU(ev); playFrom(u*buffer.duration); }
+  if(buffer){ dragging=true; playFrom(pointerU(ev)*buffer.duration); }
 });
 window.addEventListener('pointermove', ev=>{
-  if(dragging && buffer){ const u=pointerU(ev); playFrom(u*buffer.duration); }
+  if(dragging && buffer) playFrom(pointerU(ev)*buffer.duration);
 });
 window.addEventListener('pointerup', ()=>{ dragging=false; });
+$('#unlock').addEventListener('click', async ()=>{ await ensureAudio(); if(buffer) playFrom(currentU()*buffer.duration); });
 
-document.getElementById('unlock').addEventListener('click', async ()=>{
-  await ensureAudio(); if(buffer) playFrom(currentU()*buffer.duration);
-});
-
-/* ====== 启动相机 ====== */
+/* ===== 启动相机 ===== */
 (async ()=>{
   try{
     const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment', width:{ideal:1280}, height:{ideal:720}}});
     cam.srcObject=s; await cam.play();
-    const w=cam.videoWidth||1280, h=cam.videoHeight||720;
-    const cv=document.createElement('canvas'); cv.width=w; cv.height=h; capCv=cv; capCtx=cv.getContext('2d',{willReadFrequently:true});
-    log('请把整页置于取景器内（出现绿色边框即锁定）'); requestAnimationFrame(loop);
-  }catch(e){ alert('相机启动失败，请在 HTTPS 并允许相机权限'); log('相机启动失败：'+e.message); }
+    capCv=document.createElement('canvas'); capCv.width=cam.videoWidth||1280; capCv.height=cam.videoHeight||720;
+    capCtx=capCv.getContext('2d',{willReadFrequently:true});
+    log('请把整页置于取景器内（四角黑块都入框）');
+    requestAnimationFrame(loop);
+  }catch(e){
+    alert('相机启动失败：请在 HTTPS 下并允许相机权限'); log('相机启动失败：'+e.message);
+  }
 })();
 </script>
 </body>
