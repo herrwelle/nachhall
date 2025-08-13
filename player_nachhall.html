@@ -208,6 +208,15 @@
         let fingerPosition = null;
         let lastFingerTime = 0;
 
+        // 手指滑动平滑化系统
+        let fingerHistory = [];
+        let smoothedPosition = null;
+        let playbackSpeed = 1.0;
+        let targetPlaybackPosition = 0;
+        let currentPlaybackPosition = 0;
+        let isAutoPlaying = false;
+        let autoPlayTimer = null;
+
         let frameCount = 0;
         let lastFpsTime = 0;
 
@@ -614,6 +623,12 @@
             fingerTrail.style.left = (x - 10) + 'px';
             fingerTrail.style.top = (y - 10) + 'px';
 
+            // 添加到滑动历史
+            addToFingerHistory(x, y);
+
+            // 计算平滑位置和播放速度
+            updateSmoothPlayback();
+
             console.log('手指位置更新:', x, y);
 
             // 计算在频谱图中的位置
@@ -631,6 +646,13 @@
         function stopFingerTracking() {
             fingerPosition = null;
             fingerTrail.style.display = 'none';
+
+            // 停止自动播放辅助
+            stopAutoPlayAssist();
+
+            // 清空滑动历史
+            fingerHistory = [];
+
             stopAudio();
             updateDebug(
                 spectrogramRect ? `${spectrogramRect.width}x${spectrogramRect.height}` : '无',
@@ -681,6 +703,115 @@
                 console.error('音频初始化失败:', error);
                 updateInfo('音频初始化失败', 'error');
             }
+        }
+
+        // 手指滑动平滑化系统
+        function addToFingerHistory(x, y) {
+            const now = performance.now();
+            const spectPos = screenToSpectrogramCoords(x, y);
+
+            if (spectPos) {
+                fingerHistory.push({
+                    x: spectPos.x,
+                    y: spectPos.y,
+                    timestamp: now
+                });
+
+                // 只保留最近500ms的历史
+                const cutoff = now - 500;
+                fingerHistory = fingerHistory.filter(point => point.timestamp > cutoff);
+            }
+        }
+
+        function updateSmoothPlayback() {
+            if (fingerHistory.length < 2) return;
+
+            const now = performance.now();
+            const recentHistory = fingerHistory.filter(point => now - point.timestamp < 200);
+
+            if (recentHistory.length < 2) return;
+
+            // 计算平均速度
+            let totalDistance = 0;
+            let totalTime = 0;
+
+            for (let i = 1; i < recentHistory.length; i++) {
+                const prev = recentHistory[i - 1];
+                const curr = recentHistory[i];
+                const distance = Math.abs(curr.x - prev.x);
+                const time = curr.timestamp - prev.timestamp;
+
+                if (time > 0) {
+                    totalDistance += distance;
+                    totalTime += time;
+                }
+            }
+
+            if (totalTime > 0) {
+                const avgSpeed = totalDistance / totalTime; // 单位：position/ms
+
+                // 计算目标播放速度（正常速度的倍数）
+                const normalSpeed = 0.001; // 正常滑动速度基准
+                playbackSpeed = Math.max(0.1, Math.min(3.0, avgSpeed / normalSpeed));
+
+                // 更新目标位置
+                const latest = recentHistory[recentHistory.length - 1];
+                targetPlaybackPosition = latest.x;
+
+                // 开始自动播放辅助
+                startAutoPlayAssist();
+            }
+        }
+
+        function startAutoPlayAssist() {
+            if (autoPlayTimer) {
+                clearInterval(autoPlayTimer);
+            }
+
+            isAutoPlaying = true;
+
+            autoPlayTimer = setInterval(() => {
+                if (!fingerPosition || !spectrogramData) {
+                    stopAutoPlayAssist();
+                    return;
+                }
+
+                // 平滑插值到目标位置
+                const diff = targetPlaybackPosition - currentPlaybackPosition;
+                const step = diff * 0.1 * playbackSpeed; // 10%的步长，受速度影响
+
+                currentPlaybackPosition += step;
+
+                // 确保在有效范围内
+                currentPlaybackPosition = Math.max(0, Math.min(1, currentPlaybackPosition));
+
+                // 播放当前位置的音频
+                if (Math.abs(diff) > 0.01) { // 只有在位置变化足够大时才播放
+                    playAtPositionSmooth(currentPlaybackPosition);
+                }
+
+                // 如果接近目标位置且手指停止移动，停止自动播放
+                const timeSinceLastMove = performance.now() - lastFingerTime;
+                if (Math.abs(diff) < 0.02 && timeSinceLastMove > 200) {
+                    stopAutoPlayAssist();
+                }
+
+            }, 50); // 20fps的平滑播放
+        }
+
+        function stopAutoPlayAssist() {
+            if (autoPlayTimer) {
+                clearInterval(autoPlayTimer);
+                autoPlayTimer = null;
+            }
+            isAutoPlaying = false;
+        }
+
+        function playAtPositionSmooth(position) {
+            if (!audioContext || !spectrogramData || isPlaying) return;
+
+            // 使用平滑位置播放
+            playAtPosition(position);
         }
 
         function playAtPosition(position) {
