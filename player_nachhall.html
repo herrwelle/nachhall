@@ -368,8 +368,7 @@
                     updateInfo('频谱图检测成功，自动播放中...', 'found');
                     updateDebug(`${detectedRect.width}x${detectedRect.height}`, fingerPosition ? `${fingerPosition.x.toFixed(0)},${fingerPosition.y.toFixed(0)}` : '无', audioContext ? '就绪' : '未初始化');
 
-                    // 启动自动播放
-                    startAutoPlay();
+                    // 准备手动播放
                 }
             } else {
                 if (spectrogramRect) {
@@ -662,12 +661,7 @@
 
             stopAudio();
 
-            // 如果没有手指操作，重新启动自动播放
-            setTimeout(() => {
-                if (!fingerPosition && spectrogramData && autoPlayActive === false) {
-                    startAutoPlay();
-                }
-            }, 1000); // 1秒后重新开始自动播放
+            // 手动播放模式，无需自动播放
 
             updateDebug(
                 spectrogramRect ? `${spectrogramRect.width}x${spectrogramRect.height}` : '无',
@@ -940,62 +934,43 @@
             }
         }
 
-        // 增强的音频合成，利用编码的额外信息
+        // 基于源-滤波器模型的高质量猫叫声合成
         function synthesizeAudioEnhanced(frameData) {
-            const bufferLength = 4096; // 增加缓冲区长度，减少断续感
+            const bufferLength = 4096;
             const buffer = audioContext.createBuffer(1, bufferLength, SAMPLE_RATE);
             const channelData = buffer.getChannelData(0);
 
             const magnitudes = frameData.magnitudes;
 
-            // 找到主要频率成分
-            const dominantFreqs = findDominantFrequencies(magnitudes, 8);
+            // 分析频谱特征
+            const features = analyzeVocalFeatures(magnitudes);
 
-            // 生成更连续的音频
+            if (features.f0 === 0) {
+                return buffer; // 静音
+            }
+
+            // 源-滤波器合成
             for (let i = 0; i < bufferLength; i++) {
                 const t = i / SAMPLE_RATE;
-                let sample = 0;
 
-                // 基于主要频率合成
-                for (const freq of dominantFreqs) {
-                    const frequency = freq.frequency;
-                    const amplitude = freq.amplitude;
+                // 1. 声门激励源（模拟声带振动）
+                const excitation = generateGlottalPulse(features.f0, t, features.voicing);
 
-                    if (frequency > 80 && frequency < 4000) {
-                        // 基础音调
-                        let tone = Math.sin(2 * Math.PI * frequency * t);
+                // 2. 声道滤波（模拟口腔共振）
+                const filtered = applyVocalTractFilter(excitation, features.formants, t);
 
-                        // 添加轻微的调制让声音更自然
-                        const vibrato = 1 + 0.03 * Math.sin(2 * Math.PI * 6 * t);
-                        tone = Math.sin(2 * Math.PI * frequency * vibrato * t);
+                // 3. 添加气流噪声（模拟呼吸和摩擦）
+                const noise = generateAspirationNoise(features.breathiness, t);
 
-                        // 添加谐波丰富度
-                        if (frequency * 2 < SAMPLE_RATE / 2) {
-                            tone += 0.3 * Math.sin(2 * Math.PI * frequency * 2 * t);
-                        }
-                        if (frequency * 3 < SAMPLE_RATE / 2) {
-                            tone += 0.15 * Math.sin(2 * Math.PI * frequency * 3 * t);
-                        }
+                // 4. 非线性效应（模拟声带张力变化）
+                let sample = filtered + noise;
+                sample = applyNonlinearEffects(sample, features.roughness);
 
-                        sample += amplitude * tone * 0.4;
-                    }
-                }
-
-                // 添加适量的噪声纹理
-                const noiseLevel = calculateNoiseLevel(magnitudes);
-                if (noiseLevel > 0.03) {
-                    const noise = (Math.random() - 0.5) * 2;
-                    // 高通滤波噪声
-                    const filteredNoise = noise - (noise * 0.7);
-                    sample += filteredNoise * noiseLevel * 0.08;
-                }
-
-                // 更平滑的包络
-                const envelope = 1.0 - Math.exp(-t * 10); // 快速上升
+                // 5. 动态包络
+                const envelope = getDynamicEnvelope(t, bufferLength / SAMPLE_RATE, features.attack, features.decay);
                 sample *= envelope;
 
-                // 软限幅
-                channelData[i] = Math.tanh(sample * 0.9) * 0.8;
+                channelData[i] = Math.tanh(sample * 0.7) * 0.9;
             }
 
             return buffer;
@@ -1033,6 +1008,172 @@
             }
 
             return highFreqSum / (magnitudes.length - startIdx);
+        }
+
+        // 分析声学特征
+        function analyzeVocalFeatures(magnitudes) {
+            const features = {
+                f0: 0,           // 基频
+                voicing: 0,      // 有声度
+                formants: [],    // 共振峰
+                breathiness: 0,  // 气声度
+                roughness: 0,    // 粗糙度
+                attack: 0.01,    // 起音时间
+                decay: 0.3       // 衰减时间
+            };
+
+            // 基频检测
+            const f0Result = detectFundamentalFreq(magnitudes);
+            features.f0 = f0Result.frequency;
+            features.voicing = f0Result.strength;
+
+            // 共振峰检测
+            features.formants = detectFormants(magnitudes);
+
+            // 声音质量分析
+            features.breathiness = analyzeBreathiness(magnitudes);
+            features.roughness = analyzeRoughness(magnitudes);
+
+            return features;
+        }
+
+        // 改进的基频检测
+        function detectFundamentalFreq(magnitudes) {
+            const minF0 = 80;
+            const maxF0 = 1000;
+
+            let bestF0 = 0;
+            let bestScore = 0;
+
+            for (let f = minF0; f <= maxF0; f += 2) {
+                const binIndex = Math.round(f * magnitudes.length / (SAMPLE_RATE / 2));
+                if (binIndex >= magnitudes.length) continue;
+
+                let harmonicScore = 0;
+                let harmonicCount = 0;
+
+                // 检查谐波序列
+                for (let h = 1; h <= 8; h++) {
+                    const harmonicBin = Math.round(binIndex * h);
+                    if (harmonicBin < magnitudes.length) {
+                        const weight = 1.0 / h;
+                        harmonicScore += magnitudes[harmonicBin] * weight;
+                        harmonicCount++;
+                    }
+                }
+
+                harmonicScore /= harmonicCount;
+
+                // 偏好猫叫声的典型频率范围
+                if (f >= 200 && f <= 600) {
+                    harmonicScore *= 1.3;
+                }
+
+                if (harmonicScore > bestScore) {
+                    bestScore = harmonicScore;
+                    bestF0 = f;
+                }
+            }
+
+            return {
+                frequency: bestScore > 0.1 ? bestF0 : 0,
+                strength: Math.min(1.0, bestScore)
+            };
+        }
+
+        // 声门脉冲生成
+        function generateGlottalPulse(f0, t, voicing) {
+            if (f0 === 0 || voicing < 0.1) return 0;
+
+            const period = 1.0 / f0;
+            const phase = (t % period) / period;
+
+            let pulse = 0;
+            if (phase < 0.6) {
+                pulse = (1 - Math.exp(-phase * 8)) * voicing;
+            } else {
+                pulse = Math.exp(-(phase - 0.6) * 15) * voicing;
+            }
+
+            const jitter = 1 + 0.02 * Math.sin(2 * Math.PI * 7 * t);
+            return pulse * jitter;
+        }
+
+        // 声道滤波
+        function applyVocalTractFilter(excitation, formants, t) {
+            let filtered = excitation;
+
+            for (const formant of formants) {
+                const centerFreq = formant.frequency;
+                const bandwidth = formant.bandwidth || 100;
+                const amplitude = formant.amplitude;
+
+                const resonance = Math.sin(2 * Math.PI * centerFreq * t) *
+                    Math.exp(-bandwidth * t * 0.001);
+                filtered += excitation * resonance * amplitude * 0.3;
+            }
+
+            return filtered;
+        }
+
+        // 气流噪声生成
+        function generateAspirationNoise(breathiness, t) {
+            if (breathiness < 0.05) return 0;
+
+            let noise = (Math.random() - 0.5) * 2;
+            noise = noise - (noise * 0.8);
+
+            const modulation = 1 + 0.3 * Math.sin(2 * Math.PI * 12 * t);
+            return noise * breathiness * modulation * 0.15;
+        }
+
+        // 非线性效应
+        function applyNonlinearEffects(sample, roughness) {
+            if (roughness < 0.1) return sample;
+
+            const saturated = Math.tanh(sample * (1 + roughness));
+            return sample * (1 - roughness * 0.3) + saturated * roughness * 0.3;
+        }
+
+        // 动态包络
+        function getDynamicEnvelope(t, duration, attack, decay) {
+            if (t < attack) {
+                return Math.pow(t / attack, 0.3);
+            } else if (t < attack + decay) {
+                return Math.exp(-(t - attack) / (decay * 0.4));
+            } else {
+                return Math.exp(-(t - attack - decay) / (duration * 0.6)) * 0.3;
+            }
+        }
+
+        // 气声度分析
+        function analyzeBreathiness(magnitudes) {
+            let highFreqEnergy = 0;
+            let totalEnergy = 0;
+
+            for (let i = 0; i < magnitudes.length; i++) {
+                const freq = (i / magnitudes.length) * (SAMPLE_RATE / 2);
+                totalEnergy += magnitudes[i];
+
+                if (freq > 2000) {
+                    highFreqEnergy += magnitudes[i];
+                }
+            }
+
+            return totalEnergy > 0 ? Math.min(0.8, highFreqEnergy / totalEnergy) : 0;
+        }
+
+        // 粗糙度分析
+        function analyzeRoughness(magnitudes) {
+            let roughness = 0;
+
+            for (let i = 1; i < magnitudes.length - 1; i++) {
+                const variation = Math.abs(magnitudes[i] - magnitudes[i - 1]) +
+                    Math.abs(magnitudes[i] - magnitudes[i + 1]);
+                roughness += variation;
+            }
+
+            return Math.min(0.6, roughness / magnitudes.length);
         }
 
         function synthesizeAudio(magnitudes) {
