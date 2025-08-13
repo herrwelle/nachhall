@@ -716,122 +716,211 @@
         }
 
         function synthesizeAudio(magnitudes) {
-            const bufferLength = 1024;
+            const bufferLength = 2048; // 增加缓冲区长度获得更好的频率分辨率
             const buffer = audioContext.createBuffer(1, bufferLength, SAMPLE_RATE);
             const channelData = buffer.getChannelData(0);
 
-            // 找到主要的频率峰值
-            const peaks = findSpectralPeaks(magnitudes);
+            // 分析频谱特征
+            const spectralFeatures = analyzeSpectrum(magnitudes);
 
-            if (peaks.length === 0) {
-                // 如果没有找到峰值，返回静音
-                return buffer;
+            if (spectralFeatures.fundamentalFreq === 0) {
+                return buffer; // 静音
             }
 
-            // 猫叫声特征合成
+            // 猫叫声专用合成
             for (let i = 0; i < bufferLength; i++) {
-                let sample = 0;
                 const t = i / SAMPLE_RATE;
+                let sample = 0;
 
-                // 为每个峰值生成音调
-                for (let p = 0; p < peaks.length; p++) {
-                    const peak = peaks[p];
-                    const frequency = peak.frequency;
-                    const amplitude = peak.magnitude;
+                // 1. 基频和谐波合成（猫叫声的音调核心）
+                const f0 = spectralFeatures.fundamentalFreq;
+                const harmonicSample = synthesizeHarmonics(f0, spectralFeatures.harmonics, t);
+                sample += harmonicSample * 0.7;
 
-                    // 基础正弦波
-                    const phase = 2 * Math.PI * frequency * t;
-                    let tone = Math.sin(phase);
+                // 2. 共振峰合成（模拟猫的口腔共鸣）
+                const formantSample = synthesizeFormants(spectralFeatures.formants, t);
+                sample += formantSample * 0.4;
 
-                    // 添加轻微的锯齿波特征（猫叫声的粗糙感）
-                    const sawPhase = (frequency * t) % 1;
-                    tone += (sawPhase - 0.5) * 0.2;
+                // 3. 噪声成分（气流声、摩擦声）
+                const noiseSample = synthesizeNoise(spectralFeatures.noiseLevel, spectralFeatures.spectralCentroid, t);
+                sample += noiseSample * 0.3;
 
-                    // 频率调制（颤音效果）
-                    const vibrato = 1 + 0.05 * Math.sin(2 * Math.PI * 6 * t);
-                    tone = Math.sin(2 * Math.PI * frequency * vibrato * t);
+                // 4. 整体包络和动态处理
+                const envelope = getTimeEnvelope(t, bufferLength / SAMPLE_RATE);
+                sample *= envelope;
 
-                    // 幅度包络（让声音更自然）
-                    const envelope = Math.exp(-t * 2) * (1 + 0.3 * Math.sin(2 * Math.PI * 8 * t));
-
-                    sample += amplitude * tone * envelope * 0.4;
-                }
-
-                // 添加高频噪声（猫叫声的嘶嘶声）
-                const noiseLevel = getNoiseLevel(magnitudes);
-                if (noiseLevel > 0.03) {
-                    // 高通滤波的噪声
-                    const noise = (Math.random() - 0.5) * 2;
-                    const filteredNoise = noise - (noise * 0.8); // 简单高通
-                    sample += filteredNoise * noiseLevel * 0.15;
-                }
-
-                // 动态范围压缩和软限幅
-                sample = Math.tanh(sample * 1.2) * 0.7;
-                channelData[i] = sample;
+                // 软限幅和最终处理
+                channelData[i] = Math.tanh(sample * 0.8) * 0.9;
             }
 
             return buffer;
         }
 
-        // 找到频谱中的主要峰值 - 针对猫叫声优化
-        function findSpectralPeaks(magnitudes) {
-            const peaks = [];
-            const minPeakHeight = 0.08; // 降低阈值以捕获更多细节
-            const minPeakDistance = 2; // 减少最小距离
+        // 分析频谱特征
+        function analyzeSpectrum(magnitudes) {
+            const features = {
+                fundamentalFreq: 0,
+                harmonics: [],
+                formants: [],
+                noiseLevel: 0,
+                spectralCentroid: 0
+            };
 
-            // 先进行轻微平滑以减少噪声峰值
-            const smoothed = new Float32Array(magnitudes.length);
+            // 找到基频（最强的低频峰值）
+            let maxMag = 0;
+            let f0Index = 0;
+
+            // 在猫叫声典型范围内寻找基频 (100-1000Hz)
+            const minF0 = Math.floor(100 * magnitudes.length / (SAMPLE_RATE / 2));
+            const maxF0 = Math.floor(1000 * magnitudes.length / (SAMPLE_RATE / 2));
+
+            for (let i = minF0; i < maxF0; i++) {
+                if (magnitudes[i] > maxMag) {
+                    maxMag = magnitudes[i];
+                    f0Index = i;
+                }
+            }
+
+            if (maxMag > 0.1) {
+                features.fundamentalFreq = (f0Index / magnitudes.length) * (SAMPLE_RATE / 2);
+
+                // 找到谐波
+                for (let h = 2; h <= 8; h++) {
+                    const harmonicIndex = Math.round(f0Index * h);
+                    if (harmonicIndex < magnitudes.length) {
+                        features.harmonics.push({
+                            frequency: features.fundamentalFreq * h,
+                            amplitude: magnitudes[harmonicIndex]
+                        });
+                    }
+                }
+            }
+
+            // 找到共振峰（局部峰值，特别是在中频区域）
+            const formantRanges = [
+                [500, 1500],   // 第一共振峰
+                [1000, 3000],  // 第二共振峰
+                [2000, 4000]   // 第三共振峰
+            ];
+
+            for (const [minFreq, maxFreq] of formantRanges) {
+                const minIdx = Math.floor(minFreq * magnitudes.length / (SAMPLE_RATE / 2));
+                const maxIdx = Math.floor(maxFreq * magnitudes.length / (SAMPLE_RATE / 2));
+
+                let peakMag = 0;
+                let peakIdx = 0;
+
+                for (let i = minIdx; i < maxIdx; i++) {
+                    if (magnitudes[i] > peakMag) {
+                        peakMag = magnitudes[i];
+                        peakIdx = i;
+                    }
+                }
+
+                if (peakMag > 0.15) {
+                    features.formants.push({
+                        frequency: (peakIdx / magnitudes.length) * (SAMPLE_RATE / 2),
+                        amplitude: peakMag,
+                        bandwidth: 200 // 典型带宽
+                    });
+                }
+            }
+
+            // 计算噪声水平和频谱重心
+            let weightedSum = 0;
+            let totalMag = 0;
+            let highFreqSum = 0;
+
             for (let i = 0; i < magnitudes.length; i++) {
-                let sum = 0, count = 0;
-                for (let j = Math.max(0, i - 1); j <= Math.min(magnitudes.length - 1, i + 1); j++) {
-                    sum += magnitudes[j];
-                    count++;
-                }
-                smoothed[i] = sum / count;
-            }
+                const freq = (i / magnitudes.length) * (SAMPLE_RATE / 2);
+                weightedSum += freq * magnitudes[i];
+                totalMag += magnitudes[i];
 
-            for (let i = 2; i < smoothed.length - 2; i++) {
-                const current = smoothed[i];
-                const prev = smoothed[i - 1];
-                const next = smoothed[i + 1];
-
-                // 更严格的峰值检测
-                if (current > prev && current > next &&
-                    current > smoothed[i - 2] && current > smoothed[i + 2] &&
-                    current > minPeakHeight) {
-
-                    // 检查与已有峰值的距离
-                    let tooClose = false;
-                    for (const existingPeak of peaks) {
-                        if (Math.abs(i - existingPeak.index) < minPeakDistance) {
-                            if (current > existingPeak.magnitude) {
-                                // 如果新峰值更强，替换旧的
-                                peaks.splice(peaks.indexOf(existingPeak), 1);
-                            } else {
-                                tooClose = true;
-                            }
-                            break;
-                        }
-                    }
-
-                    if (!tooClose) {
-                        const frequency = (i / magnitudes.length) * (SAMPLE_RATE / 2);
-                        // 猫叫声主要在200Hz-3000Hz范围内
-                        if (frequency >= 100 && frequency <= 4000) {
-                            peaks.push({
-                                index: i,
-                                magnitude: current,
-                                frequency: frequency
-                            });
-                        }
-                    }
+                if (freq > 2000) {
+                    highFreqSum += magnitudes[i];
                 }
             }
 
-            // 按幅度排序，取前12个最强的峰值
-            peaks.sort((a, b) => b.magnitude - a.magnitude);
-            return peaks.slice(0, 12);
+            features.spectralCentroid = totalMag > 0 ? weightedSum / totalMag : 0;
+            features.noiseLevel = highFreqSum / Math.max(1, magnitudes.length * 0.3);
+
+            return features;
+        }
+
+        // 合成谐波结构
+        function synthesizeHarmonics(f0, harmonics, t) {
+            if (f0 === 0) return 0;
+
+            let sample = 0;
+
+            // 基频
+            sample += Math.sin(2 * Math.PI * f0 * t) * 0.8;
+
+            // 谐波
+            for (const harmonic of harmonics) {
+                if (harmonic.amplitude > 0.05) {
+                    // 添加轻微的相位调制模拟声带的非线性
+                    const modulation = 1 + 0.02 * Math.sin(2 * Math.PI * 7 * t);
+                    const phase = 2 * Math.PI * harmonic.frequency * t * modulation;
+                    sample += Math.sin(phase) * harmonic.amplitude * 0.6;
+                }
+            }
+
+            return sample;
+        }
+
+        // 合成共振峰
+        function synthesizeFormants(formants, t) {
+            let sample = 0;
+
+            for (const formant of formants) {
+                // 使用带通滤波器的脉冲响应近似
+                const centerFreq = formant.frequency;
+                const bandwidth = formant.bandwidth;
+                const amplitude = formant.amplitude;
+
+                // 简化的共振峰合成：调制的正弦波
+                const carrier = Math.sin(2 * Math.PI * centerFreq * t);
+                const envelope = Math.exp(-bandwidth * t) * Math.cos(2 * Math.PI * bandwidth * 0.1 * t);
+
+                sample += carrier * envelope * amplitude * 0.3;
+            }
+
+            return sample;
+        }
+
+        // 合成噪声成分
+        function synthesizeNoise(noiseLevel, spectralCentroid, t) {
+            if (noiseLevel < 0.02) return 0;
+
+            // 生成有色噪声
+            let noise = (Math.random() - 0.5) * 2;
+
+            // 根据频谱重心调整噪声特性
+            if (spectralCentroid > 2000) {
+                // 高频重心：更多高频噪声（嘶嘶声）
+                noise = noise * (1 + Math.sin(2 * Math.PI * 3000 * t) * 0.3);
+            } else {
+                // 低频重心：更多低频噪声（呼吸声）
+                noise = noise * (1 + Math.sin(2 * Math.PI * 500 * t) * 0.2);
+            }
+
+            return noise * noiseLevel;
+        }
+
+        // 时间包络
+        function getTimeEnvelope(t, duration) {
+            // 猫叫声典型的包络：快速上升，缓慢衰减
+            const attack = 0.01;  // 10ms上升时间
+            const decay = 0.3;    // 300ms衰减时间
+
+            if (t < attack) {
+                return t / attack;
+            } else if (t < attack + decay) {
+                return Math.exp(-(t - attack) / (decay * 0.3));
+            } else {
+                return Math.exp(-(t - attack - decay) / (duration * 0.5)) * 0.3;
+            }
         }
 
         // 估计噪声水平
