@@ -57,11 +57,11 @@
         }
 
         .frame-searching {
-            box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.6) inset;
+            box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.3) inset;
         }
 
         .frame-found {
-            box-shadow: 0 0 0 4px rgba(0, 255, 170, 0.9) inset;
+            box-shadow: 0 0 0 3px rgba(0, 255, 170, 0.6) inset;
         }
 
         #info {
@@ -504,52 +504,51 @@
             const { x, y, width: rectWidth, height: rectHeight } = rect;
 
             const spectData = [];
-            const timeSteps = 200; // 增加时间分辨率
-            const freqSteps = 513; // 使用与编码器相同的频率分辨率 (NFFT/2 + 1)
+            const timeSteps = 200;
+            const freqSteps = 513;
 
-            console.log(`提取频谱数据: ${timeSteps}x${freqSteps}`);
+            console.log(`提取增强频谱数据: ${timeSteps}x${freqSteps}`);
 
             for (let t = 0; t < timeSteps; t++) {
-                const frameData = new Float32Array(freqSteps);
+                const frameData = {
+                    magnitudes: new Float32Array(freqSteps),
+                    phaseHints: new Float32Array(freqSteps),
+                    harmonicHints: new Float32Array(freqSteps)
+                };
+
                 const pixelX = Math.floor(x + (t / timeSteps) * rectWidth);
 
                 for (let f = 0; f < freqSteps; f++) {
-                    // Y轴翻转：频谱图底部是低频，顶部是高频
                     const pixelY = Math.floor(y + rectHeight - (f / freqSteps) * rectHeight);
 
                     if (pixelX < width && pixelY >= 0 && pixelY < imageData.height) {
-                        // 使用3x3平均来减少噪声
-                        let brightnessSum = 0;
-                        let count = 0;
+                        // 提取RGB信息
+                        const pixelIndex = (pixelY * width + pixelX) * 4;
+                        const r = data[pixelIndex];
+                        const g = data[pixelIndex + 1];
+                        const b = data[pixelIndex + 2];
 
-                        for (let dy = -1; dy <= 1; dy++) {
-                            for (let dx = -1; dx <= 1; dx++) {
-                                const sampleX = pixelX + dx;
-                                const sampleY = pixelY + dy;
+                        // 主要幅度信息（从R通道）
+                        const normalized = (255 - r) / 255;
+                        const amplitude = Math.pow(normalized, 0.5);
+                        frameData.magnitudes[f] = amplitude * 0.8;
 
-                                if (sampleX >= 0 && sampleX < width &&
-                                    sampleY >= 0 && sampleY < imageData.height) {
-                                    brightnessSum += getPixelBrightness(data, sampleX, sampleY, width);
-                                    count++;
-                                }
-                            }
-                        }
+                        // 相位提示（从G通道）
+                        frameData.phaseHints[f] = (g - r * 0.75) / 64.0;
 
-                        const avgBrightness = brightnessSum / count;
-
-                        // 改进的幅度映射：使用对数缩放
-                        const normalized = (255 - avgBrightness) / 255;
-                        const amplitude = Math.pow(normalized, 0.5); // 平方根增强对比度
-                        frameData[f] = amplitude * 0.8; // 控制整体音量
+                        // 谐波提示（从B通道）
+                        frameData.harmonicHints[f] = (b - r * 0.75) / 16.0;
                     } else {
-                        frameData[f] = 0;
+                        frameData.magnitudes[f] = 0;
+                        frameData.phaseHints[f] = 0;
+                        frameData.harmonicHints[f] = 0;
                     }
                 }
 
                 spectData.push(frameData);
             }
 
-            console.log('频谱数据提取完成');
+            console.log('增强频谱数据提取完成');
             return spectData;
         }
 
@@ -829,14 +828,21 @@
 
                 if (!leftFrame || !rightFrame) return;
 
-                // 线性插值混合两帧
-                const interpolatedFrame = new Float32Array(leftFrame.length);
-                for (let i = 0; i < leftFrame.length; i++) {
-                    interpolatedFrame[i] = leftFrame[i] * (1 - fraction) + rightFrame[i] * fraction;
+                // 插值混合增强数据
+                const interpolatedFrame = {
+                    magnitudes: new Float32Array(leftFrame.magnitudes.length),
+                    phaseHints: new Float32Array(leftFrame.phaseHints.length),
+                    harmonicHints: new Float32Array(leftFrame.harmonicHints.length)
+                };
+
+                for (let i = 0; i < leftFrame.magnitudes.length; i++) {
+                    interpolatedFrame.magnitudes[i] = leftFrame.magnitudes[i] * (1 - fraction) + rightFrame.magnitudes[i] * fraction;
+                    interpolatedFrame.phaseHints[i] = leftFrame.phaseHints[i] * (1 - fraction) + rightFrame.phaseHints[i] * fraction;
+                    interpolatedFrame.harmonicHints[i] = leftFrame.harmonicHints[i] * (1 - fraction) + rightFrame.harmonicHints[i] * fraction;
                 }
 
                 // 生成音频
-                const audioBuffer = synthesizeAudio(interpolatedFrame);
+                const audioBuffer = synthesizeAudioEnhanced(interpolatedFrame);
                 if (audioBuffer) {
                     playAudioBuffer(audioBuffer);
                 }
@@ -844,6 +850,73 @@
             } catch (error) {
                 console.error('播放失败:', error);
             }
+        }
+
+        // 增强的音频合成，利用编码的额外信息
+        function synthesizeAudioEnhanced(frameData) {
+            const bufferLength = 2048;
+            const buffer = audioContext.createBuffer(1, bufferLength, SAMPLE_RATE);
+            const channelData = buffer.getChannelData(0);
+
+            const magnitudes = frameData.magnitudes;
+            const phaseHints = frameData.phaseHints;
+            const harmonicHints = frameData.harmonicHints;
+
+            // 更直接的频谱合成方法
+            for (let i = 0; i < bufferLength; i++) {
+                const t = i / SAMPLE_RATE;
+                let sample = 0;
+
+                // 直接从频谱重建，利用相位提示
+                for (let f = 1; f < magnitudes.length && f < 200; f++) { // 限制频率范围
+                    const magnitude = magnitudes[f];
+                    if (magnitude > 0.02) {
+                        const frequency = (f / magnitudes.length) * (SAMPLE_RATE / 2);
+
+                        // 使用相位提示
+                        const phaseOffset = phaseHints[f] * Math.PI * 2;
+
+                        // 谐波增强
+                        const harmonicBoost = 1 + harmonicHints[f] * 0.5;
+
+                        // 频率权重（偏好猫叫声频率范围）
+                        let freqWeight = 1.0;
+                        if (frequency >= 200 && frequency <= 2000) {
+                            freqWeight = 1.5; // 增强主要频率范围
+                        } else if (frequency > 4000) {
+                            freqWeight = 0.3; // 减少高频
+                        }
+
+                        const phase = 2 * Math.PI * frequency * t + phaseOffset;
+                        sample += magnitude * harmonicBoost * freqWeight * Math.sin(phase) * 0.3;
+                    }
+                }
+
+                // 添加轻微的噪声纹理
+                const noiseLevel = calculateNoiseLevel(magnitudes);
+                if (noiseLevel > 0.02) {
+                    sample += (Math.random() - 0.5) * noiseLevel * 0.1;
+                }
+
+                // 动态包络
+                const envelope = Math.exp(-t * 3) * (1 + 0.2 * Math.sin(2 * Math.PI * 8 * t));
+                sample *= envelope;
+
+                channelData[i] = Math.tanh(sample * 1.2) * 0.7;
+            }
+
+            return buffer;
+        }
+
+        function calculateNoiseLevel(magnitudes) {
+            let highFreqSum = 0;
+            const startIdx = Math.floor(magnitudes.length * 0.7);
+
+            for (let i = startIdx; i < magnitudes.length; i++) {
+                highFreqSum += magnitudes[i];
+            }
+
+            return highFreqSum / (magnitudes.length - startIdx);
         }
 
         function synthesizeAudio(magnitudes) {
@@ -1109,71 +1182,24 @@
         function drawOverlay() {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-            // 绘制手指位置（无论是否检测到频谱图）
+            // 简洁的UI设计：只在触摸时显示播放头
             if (fingerPosition) {
-                // 绘制手指位置的十字线
-                ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
-                ctx.lineWidth = 2;
-                ctx.setLineDash([5, 5]);
-
-                // 垂直线
+                // 简单的白色半透明播放头线
+                ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
+                ctx.lineWidth = 3;
                 ctx.beginPath();
                 ctx.moveTo(fingerPosition.x, 0);
                 ctx.lineTo(fingerPosition.x, canvas.height);
                 ctx.stroke();
 
-                // 水平线
+                // 播放头顶部小三角形
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
                 ctx.beginPath();
-                ctx.moveTo(0, fingerPosition.y);
-                ctx.lineTo(canvas.width, fingerPosition.y);
-                ctx.stroke();
-
-                ctx.setLineDash([]);
-
-                // 绘制手指位置圆点
-                ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
-                ctx.beginPath();
-                ctx.arc(fingerPosition.x, fingerPosition.y, 8, 0, 2 * Math.PI);
+                ctx.moveTo(fingerPosition.x, 20);
+                ctx.lineTo(fingerPosition.x - 8, 5);
+                ctx.lineTo(fingerPosition.x + 8, 5);
+                ctx.closePath();
                 ctx.fill();
-            }
-
-            if (spectrogramRect) {
-                // 绘制频谱图边框
-                const videoRect = camera.getBoundingClientRect();
-                const scaleX = videoRect.width / captureCanvas.width;
-                const scaleY = videoRect.height / captureCanvas.height;
-
-                const x = videoRect.left + spectrogramRect.x * scaleX;
-                const y = videoRect.top + spectrogramRect.y * scaleY;
-                const width = spectrogramRect.width * scaleX;
-                const height = spectrogramRect.height * scaleY;
-
-                ctx.strokeStyle = 'rgba(0, 255, 170, 0.8)';
-                ctx.lineWidth = 3;
-                ctx.strokeRect(x, y, width, height);
-
-                // 绘制播放位置指示线（在频谱图内）
-                if (fingerPosition) {
-                    const spectPos = screenToSpectrogramCoords(fingerPosition.x, fingerPosition.y);
-                    if (spectPos) {
-                        const lineX = x + spectPos.x * width;
-                        ctx.strokeStyle = 'rgba(255, 255, 0, 0.9)';
-                        ctx.lineWidth = 4;
-                        ctx.beginPath();
-                        ctx.moveTo(lineX, y);
-                        ctx.lineTo(lineX, y + height);
-                        ctx.stroke();
-
-                        // 添加播放头顶部标记
-                        ctx.fillStyle = 'rgba(255, 255, 0, 0.9)';
-                        ctx.beginPath();
-                        ctx.moveTo(lineX, y);
-                        ctx.lineTo(lineX - 8, y - 12);
-                        ctx.lineTo(lineX + 8, y - 12);
-                        ctx.closePath();
-                        ctx.fill();
-                    }
-                }
             }
         }
 
