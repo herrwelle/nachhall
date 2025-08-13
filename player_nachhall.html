@@ -1,1711 +1,305 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
-
 <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-    <title>频谱图播放器</title>
-    <style>
-        :root {
-            color-scheme: dark;
-        }
-
-        * {
-            box-sizing: border-box;
-        }
-
-        html,
-        body {
-            margin: 0;
-            height: 100%;
-            background: #000;
-            color: #fff;
-            font-family: system-ui, -apple-system, sans-serif;
-            overflow: hidden;
-        }
-
-        #stage {
-            position: fixed;
-            inset: 0;
-            display: grid;
-            place-items: center;
-            background: #000;
-        }
-
-        video {
-            max-width: 100vw;
-            max-height: 100vh;
-            display: block;
-            opacity: 0.95;
-        }
-
-        #overlay {
-            position: fixed;
-            left: 0;
-            top: 0;
-            width: 100vw;
-            height: 100vh;
-            pointer-events: auto;
-            z-index: 10;
-        }
-
-        #frame {
-            position: fixed;
-            inset: 0;
-            pointer-events: none;
-            transition: box-shadow 0.3s;
-        }
-
-        .frame-searching {
-            box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.3) inset;
-        }
-
-        .frame-found {
-            box-shadow: 0 0 0 3px rgba(0, 255, 170, 0.6) inset;
-        }
-
-        #info {
-            position: fixed;
-            top: 20px;
-            left: 20px;
-            background: rgba(0, 0, 0, 0.8);
-            padding: 15px;
-            border-radius: 8px;
-            font-size: 14px;
-            max-width: 300px;
-            line-height: 1.4;
-            z-index: 20;
-        }
-
-        #controls {
-            position: fixed;
-            bottom: 20px;
-            left: 50%;
-            transform: translateX(-50%);
-            background: rgba(0, 0, 0, 0.8);
-            padding: 15px;
-            border-radius: 8px;
-            display: flex;
-            gap: 15px;
-            align-items: center;
-            z-index: 20;
-        }
-
-        .control-btn {
-            background: #007AFF;
-            color: white;
-            border: none;
-            padding: 10px 15px;
-            border-radius: 6px;
-            font-size: 14px;
-            cursor: pointer;
-            transition: background 0.2s;
-        }
-
-        .control-btn:hover {
-            background: #0056CC;
-        }
-
-        .control-btn:disabled {
-            background: #666;
-            cursor: not-allowed;
-        }
-
-        #fingerTrail {
-            position: fixed;
-            width: 20px;
-            height: 20px;
-            background: rgba(255, 255, 255, 0.8);
-            border-radius: 50%;
-            pointer-events: none;
-            z-index: 15;
-            display: none;
-            box-shadow: 0 0 10px rgba(255, 255, 255, 0.5);
-        }
-
-        .status-indicator {
-            display: inline-block;
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            margin-right: 8px;
-        }
-
-        .status-searching {
-            background: #ffa500;
-        }
-
-        .status-found {
-            background: #00ff00;
-        }
-
-        .status-playing {
-            background: #00aaff;
-        }
-
-        .status-error {
-            background: #ff4444;
-        }
-
-        #debug {
-            position: fixed;
-            bottom: 20px;
-            right: 20px;
-            background: rgba(0, 0, 0, 0.8);
-            padding: 10px;
-            border-radius: 6px;
-            font-family: monospace;
-            font-size: 11px;
-            max-width: 200px;
-            z-index: 20;
-            opacity: 0.7;
-        }
-    </style>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<title>Nachhall 播放 · 相机驱动</title>
+<style>
+  :root{color-scheme:dark}
+  html,body{margin:0;height:100%;background:#000;color:#fff;font-family:system-ui,-apple-system,Segoe UI}
+  #stage{position:fixed;inset:0;display:grid;place-items:center;background:#000}
+  video{max-width:100vw;max-height:100vh;display:block;opacity:.98}
+  #ui{position:fixed;inset:0;pointer-events:none}
+  #frame{position:fixed;inset:0;pointer-events:none}
+  .white{box-shadow:0 0 0 3px rgba(255,255,255,.6) inset}
+  .green{box-shadow:0 0 0 4px rgba(0,255,170,.95) inset}
+</style>
 </head>
-
 <body>
-    <div id="stage">
-        <video id="camera" playsinline autoplay muted></video>
-    </div>
+<div id="stage"><video id="cam" playsinline autoplay muted></video></div>
+<canvas id="ui"></canvas>
+<div id="frame" class="white"></div>
 
-    <canvas id="overlay"></canvas>
-    <div id="frame" class="frame-searching"></div>
-    <div id="fingerTrail"></div>
+<script>
+/* 与编码页一致 */
+const SR=16000, DUR=3.0, NFFT=1024, HOP=128;
+const W=1024, H=640, H_PILOT=32, H_SPEC=H-H_PILOT, LAMBDA=16;
 
-    <div id="info">
-        <div><span class="status-indicator status-searching"></span>正在搜索频谱图...</div>
-        <div style="margin-top: 10px; font-size: 12px; opacity: 0.8;">
-            将相机对准频谱图，用手指从左到右滑动播放声音
-        </div>
-    </div>
+/* 相机与缓冲 */
+const cam=document.getElementById('cam'), ui=document.getElementById('ui'), frame=document.getElementById('frame');
+let capCv=null, capCtx=null;
 
-    <div id="controls">
-        <button class="control-btn" id="toggleCamera">切换摄像头</button>
-        <button class="control-btn" id="calibrate">重新校准</button>
-        <button class="control-btn" id="toggleDebug">调试信息</button>
-    </div>
+/* 音频合成：AudioWorklet（相位连续的加法合成 phase vocoder） */
+let actx=null, node=null;
+async function ensureAudio(){
+  if(actx) return;
+  actx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
+  const code=`
+  class PV extends AudioWorkletProcessor{
+    constructor(){
+      super();
+      this.K=256;           // 频率 bin（下采样到 256）
+      this.C=384;           // 列（下采样到 384）
+      this.sr=${SR};
+      this.cols=null;       // Float32Array 长 K*C（按列存储）
+      this.phi=new Float32Array(this.K);
+      this.gain=0;          // 速度门控
+      this.x=0; this.dx=0;  // 列位置及每样本位移
+      // 频率表
+      this.f=new Float32Array(this.K);
+      const ny=this.sr/2; for(let k=0;k<this.K;k++){ this.f[k]=k*ny/(this.K-1); }
+      this.port.onmessage = e=>{
+        const m=e.data;
+        if(m.t==='spec'){ this.K=m.K; this.C=m.C; this.cols=m.data; this.phi.fill(0); }
+        else if(m.t==='state'){ this.x=m.x; this.dx=m.dx; this.gain=m.g; }
+      };
+    }
+    process(_, outs){
+      const out=outs[0][0]; out.fill(0);
+      if(!this.cols) return true;
+      let x=this.x, dx=this.dx, C=this.C, K=this.K;
+      for(let n=0;n<out.length;n++){
+        const col0 = Math.floor(x), a = x - col0, col1 = (col0+1<C)?(col0+1):col0;
+        let s=0;
+        for(let k=0;k<K;k++){
+          const A0 = this.cols[col0*K + k], A1 = this.cols[col1*K + k];
+          const A = A0*(1-a)+A1*a;
+          this.phi[k] += 2*Math.PI*this.f[k]/this.sr; // 相位连续推进
+          s += A * Math.sin(this.phi[k]);
+        }
+        out[n] = Math.tanh(s*0.4) * this.gain; // 软限幅 + 速度门控
+        x += dx;
+        if(x<0) x=0; else if(x>C-1) x=C-1;
+      }
+      this.x=x;
+      return true;
+    }
+  }
+  registerProcessor('pv',PV);
+  `;
+  const blob=new Blob([code],{type:'application/javascript'}); const url=URL.createObjectURL(blob);
+  await actx.audioWorklet.addModule(url); URL.revokeObjectURL(url);
+  node=new AudioWorkletNode(actx,'pv',{numberOfInputs:0,numberOfOutputs:1,outputChannelCount:[1]});
+  node.connect(actx.destination);
+}
 
-    <div id="debug" style="display: none;">
-        <div>FPS: <span id="fps">0</span></div>
-        <div>检测: <span id="detection">无</span></div>
-        <div>手指: <span id="finger">无</span></div>
-        <div>音频: <span id="audio">未初始化</span></div>
-    </div>
-
-    <script>
-        // 全局变量
-        let camera = null;
-        let canvas = null;
-        let ctx = null;
-        let captureCanvas = null;
-        let captureCtx = null;
-
-        let audioContext = null;
-        let isPlaying = false;
-        let spectrogramRect = null;
-        let spectrogramData = null;
-
-        let fingerPosition = null;
-        let lastFingerTime = 0;
-
-        // 手指滑动平滑化系统
-        let fingerHistory = [];
-        let smoothedPosition = null;
-        let playbackSpeed = 1.0;
-        let targetPlaybackPosition = 0;
-        let currentPlaybackPosition = 0;
-        let isAutoPlaying = false;
-        let autoPlayTimer = null;
-
-        // 自动播放相关变量
-        let autoPlayPosition = 0;
-        let autoPlaySpeed = 0.02; // 每帧移动的位置（调整播放速度）
-        let autoPlayActive = false;
-
-        let frameCount = 0;
-        let lastFpsTime = 0;
-
-        // 音频参数（与编码器一致）
-        const SAMPLE_RATE = 16000;
-        const NFFT = 1024;
-        const HOP_LENGTH = 512;
-        const MAX_DURATION = 3; // 3秒高分辨率
-
-        // DOM元素
-        const cameraElement = document.getElementById('camera');
-        const overlay = document.getElementById('overlay');
-        const frame = document.getElementById('frame');
-        const info = document.getElementById('info');
-        const fingerTrail = document.getElementById('fingerTrail');
-        const debugPanel = document.getElementById('debug');
-
-        // 初始化
-        async function init() {
-            try {
-                await startCamera();
-                setupCanvas();
-                setupEventListeners();
-                startMainLoop();
-                updateInfo('相机启动成功，正在搜索频谱图...', 'searching');
-            } catch (error) {
-                console.error('初始化失败:', error);
-                updateInfo('相机启动失败，请允许相机权限并刷新页面', 'error');
+/* 画面：角点检测 → 透视矫正 → 提取导引条相位与频谱矩阵 */
+function grayAt(d,i){ return 0.2126*d[i]+0.7152*d[i+1]+0.0722*d[i+2]; }
+function findCorners(img,W,H){ // 在四角各找最大黑块重心（简单稳健）
+  const data=img.data, th=80, sz= Math.floor(Math.min(W,H)/8);
+  function search(x0,y0,wx,hy){
+    let best={area:0,cx:0,cy:0};
+    for(let y=y0;y<y0+hy;y+=2){
+      for(let x=x0;x<x0+wx;x+=2){
+        const i=(y*W+x)*4; if(grayAt(data,i)<th){
+          // 估一小块连通（近似以固定窗口）
+          let area=0,cx=0,cy=0;
+          const ww=sz/4, hh=sz/4;
+          for(let yy=y; yy<y+hh && yy<H; yy+=2){
+            for(let xx=x; xx<x+ww && xx<W; xx+=2){
+              const ii=(yy*W+xx)*4; const g=grayAt(data,ii); if(g<th){ area++; cx+=xx; cy+=yy; }
             }
-        }
-
-        async function startCamera() {
-            const constraints = {
-                video: {
-                    facingMode: 'environment', // 后置摄像头
-                    width: { ideal: 1280 },
-                    height: { ideal: 720 }
-                }
-            };
-
-            const stream = await navigator.mediaDevices.getUserMedia(constraints);
-            cameraElement.srcObject = stream;
-            await cameraElement.play();
-
-            camera = cameraElement;
-        }
-
-        function setupCanvas() {
-            canvas = overlay;
-            ctx = canvas.getContext('2d');
-
-            // 创建捕获画布
-            captureCanvas = document.createElement('canvas');
-            captureCtx = captureCanvas.getContext('2d', { willReadFrequently: true });
-
-            resizeCanvas();
-            window.addEventListener('resize', resizeCanvas);
-        }
-
-        function resizeCanvas() {
-            canvas.width = window.innerWidth;
-            canvas.height = window.innerHeight;
-
-            if (camera) {
-                captureCanvas.width = camera.videoWidth || 1280;
-                captureCanvas.height = camera.videoHeight || 720;
-            }
-        }
-
-        function setupEventListeners() {
-            // 触摸事件
-            canvas.addEventListener('touchstart', handleTouchStart, { passive: false });
-            canvas.addEventListener('touchmove', handleTouchMove, { passive: false });
-            canvas.addEventListener('touchend', handleTouchEnd, { passive: false });
-
-            // 鼠标事件（用于桌面测试）
-            canvas.addEventListener('mousedown', handleMouseDown);
-            canvas.addEventListener('mousemove', handleMouseMove);
-            canvas.addEventListener('mouseup', handleMouseUp);
-
-            // 控制按钮
-            document.getElementById('toggleCamera').addEventListener('click', toggleCamera);
-            document.getElementById('calibrate').addEventListener('click', recalibrate);
-            document.getElementById('toggleDebug').addEventListener('click', toggleDebug);
-        }
-
-        function updateInfo(message, status) {
-            const statusClass = `status-${status}`;
-            info.innerHTML = `
-                <div><span class="status-indicator ${statusClass}"></span>${message}</div>
-                <div style="margin-top: 10px; font-size: 12px; opacity: 0.8;">
-                    将相机对准频谱图，用手指从左到右滑动播放声音
-                </div>
-            `;
-
-            frame.className = status === 'found' ? 'frame-found' : 'frame-searching';
-        }
-
-        function updateDebug(detection, finger, audio) {
-            if (debugPanel.style.display === 'none') return;
-
-            document.getElementById('detection').textContent = detection || '无';
-            document.getElementById('finger').textContent = finger || '无';
-            document.getElementById('audio').textContent = audio || '未初始化';
-        }
-
-        // 主循环
-        function startMainLoop() {
-            function loop() {
-                frameCount++;
-
-                // 更新FPS
-                const now = performance.now();
-                if (now - lastFpsTime > 1000) {
-                    if (debugPanel.style.display !== 'none') {
-                        document.getElementById('fps').textContent = frameCount;
-                    }
-                    frameCount = 0;
-                    lastFpsTime = now;
-                }
-
-                // 处理视频帧
-                if (camera && camera.readyState === camera.HAVE_ENOUGH_DATA) {
-                    processFrame();
-                }
-
-                requestAnimationFrame(loop);
-            }
-            loop();
-        }
-
-        function processFrame() {
-            // 捕获当前帧
-            captureCtx.drawImage(camera, 0, 0, captureCanvas.width, captureCanvas.height);
-            const imageData = captureCtx.getImageData(0, 0, captureCanvas.width, captureCanvas.height);
-
-            // 检测频谱图
-            const detectedRect = detectSpectrogram(imageData);
-
-            if (detectedRect) {
-                if (!spectrogramRect || rectChanged(spectrogramRect, detectedRect)) {
-                    spectrogramRect = detectedRect;
-                    spectrogramData = extractSpectrogramData(imageData, detectedRect);
-                    updateInfo('频谱图检测成功，自动播放中...', 'found');
-                    updateDebug(`${detectedRect.width}x${detectedRect.height}`, fingerPosition ? `${fingerPosition.x.toFixed(0)},${fingerPosition.y.toFixed(0)}` : '无', audioContext ? '就绪' : '未初始化');
-
-                    // 准备手动播放
-                }
-            } else {
-                if (spectrogramRect) {
-                    spectrogramRect = null;
-                    spectrogramData = null;
-                    updateInfo('频谱图丢失，请重新对准', 'searching');
-                    updateDebug('无', '无', audioContext ? '就绪' : '未初始化');
-                }
-            }
-
-            // 更新调试信息（包括手指位置）
-            if (frameCount % 10 === 0) { // 每10帧更新一次，避免过于频繁
-                const fingerInfo = fingerPosition ? `${fingerPosition.x.toFixed(0)},${fingerPosition.y.toFixed(0)}` : '无';
-                const detectionInfo = spectrogramRect ? `${spectrogramRect.width}x${spectrogramRect.height}` : '无';
-                const audioInfo = audioContext ? (audioContext.state === 'running' ? '就绪' : audioContext.state) : '未初始化';
-                updateDebug(detectionInfo, fingerInfo, audioInfo);
-            }
-
-            // 绘制覆盖层
-            drawOverlay();
-        }
-        // 频谱图检测
-        function detectSpectrogram(imageData) {
-            const { data, width, height } = imageData;
-
-            // 寻找四个角的定位标记（黑色方块）
-            const markers = findCornerMarkers(data, width, height);
-
-            if (markers.length >= 3) {
-                // 根据标记计算频谱图区域
-                return calculateSpectrogramRect(markers, width, height);
-            }
-
-            return null;
-        }
-
-        function findCornerMarkers(data, width, height) {
-            const markers = [];
-            const threshold = 80; // 黑色阈值
-            const minMarkerSize = 10;
-            const maxMarkerSize = 50;
-
-            // 分区域搜索四个角
-            const regions = [
-                { x: 0, y: 0, w: width / 3, h: height / 3 }, // 左上
-                { x: width * 2 / 3, y: 0, w: width / 3, h: height / 3 }, // 右上
-                { x: 0, y: height * 2 / 3, w: width / 3, h: height / 3 }, // 左下
-                { x: width * 2 / 3, y: height * 2 / 3, w: width / 3, h: height / 3 } // 右下
-            ];
-
-            for (const region of regions) {
-                const marker = findMarkerInRegion(data, width, height, region, threshold, minMarkerSize, maxMarkerSize);
-                if (marker) {
-                    markers.push(marker);
-                }
-            }
-
-            return markers;
-        }
-
-        function findMarkerInRegion(data, width, height, region, threshold, minSize, maxSize) {
-            const { x: rx, y: ry, w: rw, h: rh } = region;
-
-            for (let y = ry; y < ry + rh - minSize; y += 3) {
-                for (let x = rx; x < rx + rw - minSize; x += 3) {
-                    // 检查是否是黑色区域的开始
-                    if (getPixelBrightness(data, x, y, width) < threshold) {
-                        const markerSize = measureMarkerSize(data, width, height, x, y, threshold, maxSize);
-                        if (markerSize >= minSize && markerSize <= maxSize) {
-                            return { x: x + markerSize / 2, y: y + markerSize / 2, size: markerSize };
-                        }
-                    }
-                }
-            }
-
-            return null;
-        }
-
-        function getPixelBrightness(data, x, y, width) {
-            const index = (y * width + x) * 4;
-            return (data[index] + data[index + 1] + data[index + 2]) / 3;
-        }
-
-        function measureMarkerSize(data, width, height, startX, startY, threshold, maxSize) {
-            let size = 0;
-
-            // 向右下方测量正方形大小
-            for (let s = 1; s <= maxSize; s++) {
-                const x = startX + s;
-                const y = startY + s;
-
-                if (x >= width || y >= height) break;
-
-                if (getPixelBrightness(data, x, y, width) >= threshold) {
-                    break;
-                }
-
-                size = s;
-            }
-
-            return size;
-        }
-
-        function calculateSpectrogramRect(markers, width, height) {
-            if (markers.length < 3) return null;
-
-            // 找到边界
-            let minX = width, maxX = 0, minY = height, maxY = 0;
-
-            for (const marker of markers) {
-                minX = Math.min(minX, marker.x);
-                maxX = Math.max(maxX, marker.x);
-                minY = Math.min(minY, marker.y);
-                maxY = Math.max(maxY, marker.y);
-            }
-
-            // 估算频谱图区域（标记之间的区域）
-            const margin = 20; // 标记到频谱图的距离
-            return {
-                x: minX + margin,
-                y: minY + margin,
-                width: maxX - minX - 2 * margin,
-                height: maxY - minY - 2 * margin
-            };
-        }
-
-        function rectChanged(oldRect, newRect) {
-            if (!oldRect || !newRect) return true;
-
-            const threshold = 20;
-            return Math.abs(oldRect.x - newRect.x) > threshold ||
-                Math.abs(oldRect.y - newRect.y) > threshold ||
-                Math.abs(oldRect.width - newRect.width) > threshold ||
-                Math.abs(oldRect.height - newRect.height) > threshold;
-        }
-
-        // 提取频谱图数据
-        function extractSpectrogramData(imageData, rect) {
-            const { data, width } = imageData;
-            const { x, y, width: rectWidth, height: rectHeight } = rect;
-
-            const spectData = [];
-            const timeSteps = 500; // 与编码器一致，现在支持3秒高分辨率
-            const freqSteps = 513;
-
-            console.log(`提取增强频谱数据: ${timeSteps}x${freqSteps}`);
-
-            for (let t = 0; t < timeSteps; t++) {
-                const frameData = {
-                    magnitudes: new Float32Array(freqSteps),
-                    phaseHints: new Float32Array(freqSteps),
-                    harmonicHints: new Float32Array(freqSteps)
-                };
-
-                const pixelX = Math.floor(x + (t / timeSteps) * rectWidth);
-
-                for (let f = 0; f < freqSteps; f++) {
-                    const pixelY = Math.floor(y + rectHeight - (f / freqSteps) * rectHeight);
-
-                    if (pixelX < width && pixelY >= 0 && pixelY < imageData.height) {
-                        // 提取RGB信息
-                        const pixelIndex = (pixelY * width + pixelX) * 4;
-                        const r = data[pixelIndex];
-                        const g = data[pixelIndex + 1];
-                        const b = data[pixelIndex + 2];
-
-                        // 主要幅度信息（从R通道）
-                        const normalized = (255 - r) / 255;
-                        const amplitude = Math.pow(normalized, 0.5);
-                        frameData.magnitudes[f] = amplitude * 0.8;
-
-                        // 相位提示（从G通道）
-                        frameData.phaseHints[f] = (g - r * 0.75) / 64.0;
-
-                        // 谐波提示（从B通道）
-                        frameData.harmonicHints[f] = (b - r * 0.75) / 16.0;
-                    } else {
-                        frameData.magnitudes[f] = 0;
-                        frameData.phaseHints[f] = 0;
-                        frameData.harmonicHints[f] = 0;
-                    }
-                }
-
-                spectData.push(frameData);
-            }
-
-            console.log('增强频谱数据提取完成');
-            return spectData;
-        }
-
-        // 触摸和鼠标事件处理
-        function handleTouchStart(e) {
-            e.preventDefault();
-            console.log('触摸开始:', e.touches.length);
-            if (e.touches.length > 0) {
-                const touch = e.touches[0];
-                startFingerTracking(touch.clientX, touch.clientY);
-            }
-        }
-
-        function handleTouchMove(e) {
-            e.preventDefault();
-            if (e.touches.length > 0) {
-                const touch = e.touches[0];
-                updateFingerPosition(touch.clientX, touch.clientY);
-            }
-        }
-
-        function handleTouchEnd(e) {
-            e.preventDefault();
-            console.log('触摸结束');
-            stopFingerTracking();
-        }
-
-        function handleMouseDown(e) {
-            console.log('鼠标按下:', e.clientX, e.clientY);
-            startFingerTracking(e.clientX, e.clientY);
-        }
-
-        function handleMouseMove(e) {
-            if (fingerPosition) {
-                updateFingerPosition(e.clientX, e.clientY);
-            }
-        }
-
-        function handleMouseUp(e) {
-            console.log('鼠标释放');
-            stopFingerTracking();
-        }
-
-        async function startFingerTracking(x, y) {
-            console.log('开始手指跟踪:', x, y);
-
-            // 固定Y坐标为初始触摸位置，只允许X方向移动控制播放
-            fingerPosition = { x, y };
-            lastFingerTime = performance.now();
-
-            // 初始化音频上下文
-            if (!audioContext) {
-                await initAudioContext();
-            }
-
-            // 显示手指轨迹
-            fingerTrail.style.display = 'block';
-            fingerTrail.style.left = (x - 10) + 'px';
-            fingerTrail.style.top = (y - 10) + 'px';
-
-            console.log('固定Y坐标为:', y, '只响应X方向移动');
-            updateFingerPosition(x, y);
-        }
-
-        function updateFingerPosition(x, y) {
-            if (!fingerPosition) return;
-
-            // 只更新X坐标，Y坐标保持初始值（避免上下移动影响播放）
-            const deltaX = x - fingerPosition.x;
-            fingerPosition.x = x;
-            // fingerPosition.y 保持不变，只用于显示
-            lastFingerTime = performance.now();
-
-            // 更新手指轨迹显示（视觉反馈）
-            fingerTrail.style.left = (x - 10) + 'px';
-            fingerTrail.style.top = (y - 10) + 'px';
-
-            // 只记录X方向的移动历史
-            addToFingerHistory(x, fingerPosition.y);
-
-            // 计算平滑播放（只基于X方向移动）
-            updateSmoothPlayback();
-
-            console.log('手指X位置更新:', x, '移动量:', deltaX);
-
-            // 只使用X坐标计算频谱图位置（Y坐标使用初始位置）
-            const spectPosition = screenToSpectrogramCoords(x, fingerPosition.y);
-            if (spectPosition) {
-                console.log('频谱X位置:', spectPosition.x);
-
-                // 只有当X方向有明显移动时才播放
-                if (Math.abs(deltaX) > 2) {
-                    playAtPosition(spectPosition.x);
-                }
-
-                updateDebug(
-                    `${spectrogramRect.width}x${spectrogramRect.height}`,
-                    `${spectPosition.x.toFixed(2)}`,
-                    isPlaying ? '播放中' : '就绪'
-                );
-            } else {
-                console.log('手指不在频谱图X范围内');
-            }
-        }
-
-        function stopFingerTracking() {
-            fingerPosition = null;
-            fingerTrail.style.display = 'none';
-
-            // 停止自动播放辅助
-            stopAutoPlayAssist();
-
-            // 清空滑动历史
-            fingerHistory = [];
-
-            stopAudio();
-
-            // 手动播放模式，无需自动播放
-
-            updateDebug(
-                spectrogramRect ? `${spectrogramRect.width}x${spectrogramRect.height}` : '无',
-                '无',
-                audioContext ? '就绪' : '未初始化'
-            );
-        }
-
-        function screenToSpectrogramCoords(screenX, screenY) {
-            if (!spectrogramRect) return null;
-
-            // 获取相机显示区域
-            const videoRect = camera.getBoundingClientRect();
-            const scaleX = captureCanvas.width / videoRect.width;
-            const scaleY = captureCanvas.height / videoRect.height;
-
-            // 转换到相机坐标
-            const cameraX = (screenX - videoRect.left) * scaleX;
-            const cameraY = (screenY - videoRect.top) * scaleY;
-
-            // 转换到频谱图坐标
-            const spectX = (cameraX - spectrogramRect.x) / spectrogramRect.width;
-            const spectY = (cameraY - spectrogramRect.y) / spectrogramRect.height;
-
-            // 检查是否在频谱图范围内
-            if (spectX >= 0 && spectX <= 1 && spectY >= 0 && spectY <= 1) {
-                return { x: spectX, y: 1 - spectY }; // Y轴翻转
-            }
-
-            return null;
-        }
-
-        // 音频播放
-        async function initAudioContext() {
-            try {
-                console.log('初始化音频上下文...');
-                audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                    sampleRate: SAMPLE_RATE
-                });
-
-                if (audioContext.state === 'suspended') {
-                    await audioContext.resume();
-                }
-
-                console.log('音频上下文状态:', audioContext.state);
-                updateInfo('音频系统就绪，开始滑动播放', 'found');
-            } catch (error) {
-                console.error('音频初始化失败:', error);
-                updateInfo('音频初始化失败', 'error');
-            }
-        }
-
-        // 手指滑动平滑化系统
-        function addToFingerHistory(x, y) {
-            const now = performance.now();
-            const spectPos = screenToSpectrogramCoords(x, y);
-
-            if (spectPos) {
-                fingerHistory.push({
-                    x: spectPos.x,
-                    y: spectPos.y,
-                    timestamp: now
-                });
-
-                // 只保留最近500ms的历史
-                const cutoff = now - 500;
-                fingerHistory = fingerHistory.filter(point => point.timestamp > cutoff);
-            }
-        }
-
-        function updateSmoothPlayback() {
-            if (fingerHistory.length < 2) return;
-
-            const now = performance.now();
-            const recentHistory = fingerHistory.filter(point => now - point.timestamp < 150);
-
-            if (recentHistory.length < 2) return;
-
-            // 只计算X方向的移动速度
-            let totalXDistance = 0;
-            let totalTime = 0;
-            let direction = 0; // 1为向右，-1为向左
-
-            for (let i = 1; i < recentHistory.length; i++) {
-                const prev = recentHistory[i - 1];
-                const curr = recentHistory[i];
-                const xDistance = curr.x - prev.x; // 保持方向信息
-                const time = curr.timestamp - prev.timestamp;
-
-                if (time > 0 && Math.abs(xDistance) > 1) { // 过滤微小移动
-                    totalXDistance += Math.abs(xDistance);
-                    totalTime += time;
-                    direction += Math.sign(xDistance);
-                }
-            }
-
-            if (totalTime > 0 && totalXDistance > 5) { // 确保有足够的移动距离
-                const avgSpeed = totalXDistance / totalTime; // X方向速度
-                direction = Math.sign(direction); // 主要移动方向
-
-                // 只有向右移动时才辅助播放
-                if (direction > 0) {
-                    const normalSpeed = 0.5; // 调整基准速度
-                    playbackSpeed = Math.max(0.5, Math.min(2.0, avgSpeed / normalSpeed));
-
-                    // 更新目标位置（只使用X坐标）
-                    const latest = recentHistory[recentHistory.length - 1];
-                    const spectPos = screenToSpectrogramCoords(latest.x, fingerPosition.y);
-                    if (spectPos) {
-                        targetPlaybackPosition = spectPos.x;
-                        startAutoPlayAssist();
-                    }
-                } else {
-                    // 向左移动或静止时停止辅助播放
-                    stopAutoPlayAssist();
-                }
-            }
-        }
-
-        function startAutoPlayAssist() {
-            if (autoPlayTimer) {
-                clearInterval(autoPlayTimer);
-            }
-
-            isAutoPlaying = true;
-
-            autoPlayTimer = setInterval(() => {
-                if (!fingerPosition || !spectrogramData) {
-                    stopAutoPlayAssist();
-                    return;
-                }
-
-                // 平滑插值到目标位置
-                const diff = targetPlaybackPosition - currentPlaybackPosition;
-                const step = diff * 0.1 * playbackSpeed; // 10%的步长，受速度影响
-
-                currentPlaybackPosition += step;
-
-                // 确保在有效范围内
-                currentPlaybackPosition = Math.max(0, Math.min(1, currentPlaybackPosition));
-
-                // 播放当前位置的音频
-                if (Math.abs(diff) > 0.01) { // 只有在位置变化足够大时才播放
-                    playAtPositionSmooth(currentPlaybackPosition);
-                }
-
-                // 如果接近目标位置且手指停止移动，停止自动播放
-                const timeSinceLastMove = performance.now() - lastFingerTime;
-                if (Math.abs(diff) < 0.02 && timeSinceLastMove > 200) {
-                    stopAutoPlayAssist();
-                }
-
-            }, 50); // 20fps的平滑播放
-        }
-
-        function stopAutoPlayAssist() {
-            if (autoPlayTimer) {
-                clearInterval(autoPlayTimer);
-                autoPlayTimer = null;
-            }
-            isAutoPlaying = false;
-        }
-
-        // 自动播放功能
-        function startAutoPlay() {
-            if (autoPlayActive || !spectrogramData) return;
-
-            autoPlayActive = true;
-            autoPlayPosition = 0;
-
-            // 初始化音频上下文
-            if (!audioContext) {
-                initAudioContext();
-            }
-
-            console.log('开始自动播放16秒音频');
-
-            const autoPlayInterval = setInterval(() => {
-                if (!spectrogramData || !autoPlayActive) {
-                    clearInterval(autoPlayInterval);
-                    autoPlayActive = false;
-                    return;
-                }
-
-                // 如果用户开始手动操作，停止自动播放
-                if (fingerPosition) {
-                    clearInterval(autoPlayInterval);
-                    autoPlayActive = false;
-                    console.log('用户开始手动操作，停止自动播放');
-                    return;
-                }
-
-                // 播放当前位置
-                if (!isPlaying) {
-                    playAtPositionSmooth(autoPlayPosition);
-                }
-
-                // 更新播放位置
-                autoPlayPosition += autoPlaySpeed;
-
-                // 循环播放
-                if (autoPlayPosition >= 1.0) {
-                    autoPlayPosition = 0;
-                    console.log('自动播放循环重新开始');
-                }
-
-                // 更新虚拟手指位置用于显示播放头
-                if (spectrogramRect) {
-                    const videoRect = camera.getBoundingClientRect();
-                    const scaleX = videoRect.width / captureCanvas.width;
-                    const spectScreenX = videoRect.left + spectrogramRect.x * scaleX;
-                    const spectScreenWidth = spectrogramRect.width * scaleX;
-
-                    // 创建虚拟手指位置
-                    const virtualX = spectScreenX + autoPlayPosition * spectScreenWidth;
-                    const virtualY = videoRect.top + videoRect.height / 2;
-
-                    // 更新显示用的手指位置
-                    if (!fingerPosition) {
-                        fingerPosition = { x: virtualX, y: virtualY };
-                    } else {
-                        fingerPosition.x = virtualX;
-                        fingerPosition.y = virtualY;
-                    }
-                }
-
-            }, 100); // 10fps的自动播放
-        }
-
-        function stopAutoPlay() {
-            autoPlayActive = false;
-            autoPlayPosition = 0;
-            console.log('停止自动播放');
-        }
-
-        function playAtPositionSmooth(position) {
-            if (!audioContext || !spectrogramData || isPlaying) return;
-
-            // 使用平滑位置播放
-            playAtPosition(position);
-        }
-
-        function playAtPosition(position) {
-            console.log('playAtPosition调用:', position);
-
-            if (!audioContext) {
-                console.log('音频上下文未初始化');
-                return;
-            }
-            if (!spectrogramData) {
-                console.log('频谱数据不存在');
-                return;
-            }
-            if (isPlaying) {
-                console.log('正在播放中，跳过');
-                return;
-            }
-
-            try {
-                // 使用线性插值获取更平滑的频谱数据
-                const exactIndex = position * (spectrogramData.length - 1);
-                const leftIndex = Math.floor(exactIndex);
-                const rightIndex = Math.min(leftIndex + 1, spectrogramData.length - 1);
-                const fraction = exactIndex - leftIndex;
-
-                const leftFrame = spectrogramData[leftIndex];
-                const rightFrame = spectrogramData[rightIndex];
-
-                if (!leftFrame || !rightFrame) return;
-
-                // 插值混合4通道增强数据
-                const interpolatedFrame = {
-                    magnitudes: new Float32Array(leftFrame.magnitudes.length),
-                    phases: new Float32Array(leftFrame.phases ? leftFrame.phases.length : leftFrame.magnitudes.length),
-                    freqDerivs: new Float32Array(leftFrame.freqDerivs ? leftFrame.freqDerivs.length : leftFrame.magnitudes.length),
-                    envelopes: new Float32Array(leftFrame.envelopes ? leftFrame.envelopes.length : leftFrame.magnitudes.length)
-                };
-
-                for (let i = 0; i < leftFrame.magnitudes.length; i++) {
-                    interpolatedFrame.magnitudes[i] = leftFrame.magnitudes[i] * (1 - fraction) + rightFrame.magnitudes[i] * fraction;
-
-                    // 处理相位信息（如果存在）
-                    if (leftFrame.phases && rightFrame.phases) {
-                        interpolatedFrame.phases[i] = leftFrame.phases[i] * (1 - fraction) + rightFrame.phases[i] * fraction;
-                    }
-
-                    // 处理频率导数（如果存在）
-                    if (leftFrame.freqDerivs && rightFrame.freqDerivs) {
-                        interpolatedFrame.freqDerivs[i] = leftFrame.freqDerivs[i] * (1 - fraction) + rightFrame.freqDerivs[i] * fraction;
-                    }
-
-                    // 处理包络信息（如果存在）
-                    if (leftFrame.envelopes && rightFrame.envelopes) {
-                        interpolatedFrame.envelopes[i] = leftFrame.envelopes[i] * (1 - fraction) + rightFrame.envelopes[i] * fraction;
-                    }
-                }
-
-                // 使用IFFT方法生成音频
-                const audioBuffer = synthesizeAudioFallback(interpolatedFrame);
-                if (audioBuffer) {
-                    playAudioBuffer(audioBuffer);
-                }
-
-            } catch (error) {
-                console.error('播放失败:', error);
-            }
-        }
-
-        // 基于源-滤波器模型的高质量猫叫声合成
-        function synthesizeAudioEnhanced(frameData) {
-            const bufferLength = 4096;
-            const buffer = audioContext.createBuffer(1, bufferLength, SAMPLE_RATE);
-            const channelData = buffer.getChannelData(0);
-
-            const magnitudes = frameData.magnitudes;
-
-            try {
-                // 分析频谱特征
-                const features = analyzeVocalFeatures(magnitudes);
-                console.log('合成特征:', features);
-
-                if (features.f0 === 0) {
-                    console.log('没有检测到基频，使用备用合成');
-                    return synthesizeAudioFallback(frameData);
-                }
-
-                // 源-滤波器合成
-                for (let i = 0; i < bufferLength; i++) {
-                    const t = i / SAMPLE_RATE;
-
-                    // 1. 声门激励源（模拟声带振动）
-                    const excitation = generateGlottalPulse(features.f0, t, features.voicing);
-
-                    // 2. 声道滤波（模拟口腔共振）
-                    const filtered = applyVocalTractFilter(excitation, features.formants, t);
-
-                    // 3. 添加气流噪声（模拟呼吸和摩擦）
-                    const noise = generateAspirationNoise(features.breathiness, t);
-
-                    // 4. 非线性效应（模拟声带张力变化）
-                    let sample = filtered + noise;
-                    sample = applyNonlinearEffects(sample, features.roughness);
-
-                    // 5. 动态包络
-                    const envelope = getDynamicEnvelope(t, bufferLength / SAMPLE_RATE, features.attack, features.decay);
-                    sample *= envelope;
-
-                    channelData[i] = Math.tanh(sample * 0.7) * 0.9;
-                }
-
-                return buffer;
-
-            } catch (error) {
-                console.error('高级合成失败，使用备用方法:', error);
-                return synthesizeAudioFallback(frameData);
-            }
-        }
-
-        // 备用合成方法
-        function synthesizeAudioFallback(frameData) {
-            console.log('使用源-滤波器模型合成');
-            const bufferLength = 2048;
-            const buffer = audioContext.createBuffer(1, bufferLength, SAMPLE_RATE);
-            const channelData = buffer.getChannelData(0);
-
-            const magnitudes = frameData.magnitudes;
-
-            // 1. 分析频谱特征，提取稳定的基频
-            const fundamentalFreq = extractStableFundamental(magnitudes);
-            if (fundamentalFreq < 100 || fundamentalFreq > 1000) {
-                console.log('基频异常:', fundamentalFreq, '使用默认值');
-                return generateSilence(bufferLength);
-            }
-
-            // 2. 分析共振峰（formants）
-            const formants = extractFormants(magnitudes);
-
-            // 3. 计算总体能量
-            const totalEnergy = magnitudes.reduce((sum, mag) => sum + mag * mag, 0);
-            if (totalEnergy < 0.01) {
-                return generateSilence(bufferLength);
-            }
-
-            console.log(`合成参数: F0=${fundamentalFreq.toFixed(1)}Hz, 共振峰:`, formants.map(f => f.toFixed(0)));
-
-            // 4. 源-滤波器合成
-            for (let i = 0; i < bufferLength; i++) {
-                const t = i / SAMPLE_RATE;
-
-                // 源信号：基频 + 谐波
-                let source = 0;
-                const f0 = fundamentalFreq;
-
-                // 基频和前8个谐波
-                for (let harmonic = 1; harmonic <= 8; harmonic++) {
-                    const freq = f0 * harmonic;
-                    if (freq > SAMPLE_RATE / 2) break;
-
-                    // 谐波幅度衰减：1/n^0.7 (更自然的衰减)
-                    const amplitude = Math.pow(harmonic, -0.7);
-
-                    // 添加轻微的相位噪声模拟自然变化
-                    const phaseNoise = 0.1 * Math.sin(2 * Math.PI * 7 * t) * Math.random();
-
-                    source += amplitude * Math.sin(2 * Math.PI * freq * t + phaseNoise);
-                }
-
-                // 滤波器：共振峰滤波
-                let filtered = source;
-                for (const formantFreq of formants) {
-                    // 简化的共振峰增强
-                    const resonance = 1 + 0.3 * Math.exp(-Math.pow((f0 - formantFreq) / (formantFreq * 0.1), 2));
-                    filtered *= resonance;
-                }
-
-                // 添加适量的噪声成分（气流声）
-                const noiseLevel = Math.sqrt(totalEnergy) * 0.05;
-                const noise = (Math.random() - 0.5) * 2 * noiseLevel;
-                filtered += noise;
-
-                // 自然包络
-                let envelope = 1.0;
-                const duration = bufferLength / SAMPLE_RATE;
-                if (t < 0.003) {
-                    envelope = t / 0.003; // 3ms攻击
-                } else if (t > duration * 0.8) {
-                    const fadeStart = duration * 0.8;
-                    const fadeLength = duration * 0.2;
-                    envelope = Math.exp(-(t - fadeStart) / (fadeLength * 0.3));
-                }
-
-                // 应用包络和总体音量
-                const volume = Math.sqrt(totalEnergy) * 0.4;
-                filtered *= envelope * volume;
-
-                // 软限制
-                channelData[i] = Math.tanh(filtered * 0.8) * 0.7;
-            }
-
-            return buffer;
-        }
-
-        // 提取稳定的基频
-        function extractStableFundamental(magnitudes) {
-            const candidates = [];
-
-            // 在猫叫声的典型基频范围内寻找峰值
-            const minF0 = 150; // Hz
-            const maxF0 = 800; // Hz
-            const minBin = Math.floor(minF0 * magnitudes.length * 2 / SAMPLE_RATE);
-            const maxBin = Math.floor(maxF0 * magnitudes.length * 2 / SAMPLE_RATE);
-
-            for (let i = minBin; i < Math.min(maxBin, magnitudes.length - 2); i++) {
-                if (magnitudes[i] > 0.1 &&
-                    magnitudes[i] > magnitudes[i - 1] &&
-                    magnitudes[i] > magnitudes[i + 1]) {
-
-                    const freq = (i / magnitudes.length) * (SAMPLE_RATE / 2);
-                    candidates.push({ freq, magnitude: magnitudes[i] });
-                }
-            }
-
-            if (candidates.length === 0) return 300; // 默认基频
-
-            // 选择最强的候选基频
-            candidates.sort((a, b) => b.magnitude - a.magnitude);
-            return candidates[0].freq;
-        }
-
-        // 提取共振峰
-        function extractFormants(magnitudes) {
-            const formants = [];
-
-            // 猫叫声的典型共振峰范围
-            const formantRanges = [
-                [400, 1200],   // F1
-                [1000, 2500],  // F2
-                [2000, 4000]   // F3
-            ];
-
-            for (const [minF, maxF] of formantRanges) {
-                const minBin = Math.floor(minF * magnitudes.length * 2 / SAMPLE_RATE);
-                const maxBin = Math.floor(maxF * magnitudes.length * 2 / SAMPLE_RATE);
-
-                let maxMag = 0;
-                let maxBin_idx = minBin;
-
-                for (let i = minBin; i < Math.min(maxBin, magnitudes.length); i++) {
-                    if (magnitudes[i] > maxMag) {
-                        maxMag = magnitudes[i];
-                        maxBin_idx = i;
-                    }
-                }
-
-                if (maxMag > 0.05) {
-                    const formantFreq = (maxBin_idx / magnitudes.length) * (SAMPLE_RATE / 2);
-                    formants.push(formantFreq);
-                }
-            }
-
-            return formants.length > 0 ? formants : [800, 1600, 2800]; // 默认共振峰
-        }
-
-        // 生成静音
-        function generateSilence(bufferLength) {
-            const buffer = audioContext.createBuffer(1, bufferLength, SAMPLE_RATE);
-            return buffer;
-        }
-
-        // 找到主要频率成分
-        function findDominantFrequencies(magnitudes, count) {
-            const frequencies = [];
-
-            // 找到所有显著的频率峰值
-            for (let i = 2; i < magnitudes.length - 2; i++) {
-                const magnitude = magnitudes[i];
-                if (magnitude > 0.05 &&
-                    magnitude > magnitudes[i - 1] &&
-                    magnitude > magnitudes[i + 1] &&
-                    magnitude > magnitudes[i - 2] &&
-                    magnitude > magnitudes[i + 2]) {
-
-                    const frequency = (i / magnitudes.length) * (SAMPLE_RATE / 2);
-                    frequencies.push({ frequency, amplitude: magnitude });
-                }
-            }
-
-            // 按幅度排序，取前N个
-            frequencies.sort((a, b) => b.amplitude - a.amplitude);
-            return frequencies.slice(0, count);
-        }
-
-        function calculateNoiseLevel(magnitudes) {
-            let highFreqSum = 0;
-            const startIdx = Math.floor(magnitudes.length * 0.7);
-
-            for (let i = startIdx; i < magnitudes.length; i++) {
-                highFreqSum += magnitudes[i];
-            }
-
-            return highFreqSum / (magnitudes.length - startIdx);
-        }
-
-        // 分析声学特征
-        function analyzeVocalFeatures(magnitudes) {
-            const features = {
-                f0: 0,           // 基频
-                voicing: 0,      // 有声度
-                formants: [],    // 共振峰
-                breathiness: 0,  // 气声度
-                roughness: 0,    // 粗糙度
-                attack: 0.01,    // 起音时间
-                decay: 0.3       // 衰减时间
-            };
-
-            // 基频检测
-            const f0Result = detectFundamentalFreq(magnitudes);
-            features.f0 = f0Result.frequency;
-            features.voicing = f0Result.strength;
-
-            // 共振峰检测
-            features.formants = findFormants(magnitudes);
-
-            // 声音质量分析
-            features.breathiness = analyzeBreathiness(magnitudes);
-            features.roughness = analyzeRoughness(magnitudes);
-
-            return features;
-        }
-
-        // 改进的基频检测
-        function detectFundamentalFreq(magnitudes) {
-            const minF0 = 80;
-            const maxF0 = 1000;
-
-            let bestF0 = 0;
-            let bestScore = 0;
-
-            for (let f = minF0; f <= maxF0; f += 2) {
-                const binIndex = Math.round(f * magnitudes.length / (SAMPLE_RATE / 2));
-                if (binIndex >= magnitudes.length) continue;
-
-                let harmonicScore = 0;
-                let harmonicCount = 0;
-
-                // 检查谐波序列
-                for (let h = 1; h <= 8; h++) {
-                    const harmonicBin = Math.round(binIndex * h);
-                    if (harmonicBin < magnitudes.length) {
-                        const weight = 1.0 / h;
-                        harmonicScore += magnitudes[harmonicBin] * weight;
-                        harmonicCount++;
-                    }
-                }
-
-                harmonicScore /= harmonicCount;
-
-                // 偏好猫叫声的典型频率范围
-                if (f >= 200 && f <= 600) {
-                    harmonicScore *= 1.3;
-                }
-
-                if (harmonicScore > bestScore) {
-                    bestScore = harmonicScore;
-                    bestF0 = f;
-                }
-            }
-
-            return {
-                frequency: bestScore > 0.1 ? bestF0 : 0,
-                strength: Math.min(1.0, bestScore)
-            };
-        }
-
-        // 声门脉冲生成
-        function generateGlottalPulse(f0, t, voicing) {
-            if (f0 === 0 || voicing < 0.1) return 0;
-
-            const period = 1.0 / f0;
-            const phase = (t % period) / period;
-
-            let pulse = 0;
-            if (phase < 0.6) {
-                pulse = (1 - Math.exp(-phase * 8)) * voicing;
-            } else {
-                pulse = Math.exp(-(phase - 0.6) * 15) * voicing;
-            }
-
-            const jitter = 1 + 0.02 * Math.sin(2 * Math.PI * 7 * t);
-            return pulse * jitter;
-        }
-
-        // 声道滤波
-        function applyVocalTractFilter(excitation, formants, t) {
-            let filtered = excitation;
-
-            for (const formant of formants) {
-                const centerFreq = formant.frequency;
-                const bandwidth = formant.bandwidth || 100;
-                const amplitude = formant.amplitude;
-
-                const resonance = Math.sin(2 * Math.PI * centerFreq * t) *
-                    Math.exp(-bandwidth * t * 0.001);
-                filtered += excitation * resonance * amplitude * 0.3;
-            }
-
-            return filtered;
-        }
-
-        // 气流噪声生成
-        function generateAspirationNoise(breathiness, t) {
-            if (breathiness < 0.05) return 0;
-
-            let noise = (Math.random() - 0.5) * 2;
-            noise = noise - (noise * 0.8);
-
-            const modulation = 1 + 0.3 * Math.sin(2 * Math.PI * 12 * t);
-            return noise * breathiness * modulation * 0.15;
-        }
-
-        // 非线性效应
-        function applyNonlinearEffects(sample, roughness) {
-            if (roughness < 0.1) return sample;
-
-            const saturated = Math.tanh(sample * (1 + roughness));
-            return sample * (1 - roughness * 0.3) + saturated * roughness * 0.3;
-        }
-
-        // 动态包络
-        function getDynamicEnvelope(t, duration, attack, decay) {
-            if (t < attack) {
-                return Math.pow(t / attack, 0.3);
-            } else if (t < attack + decay) {
-                return Math.exp(-(t - attack) / (decay * 0.4));
-            } else {
-                return Math.exp(-(t - attack - decay) / (duration * 0.6)) * 0.3;
-            }
-        }
-
-        // 气声度分析
-        function analyzeBreathiness(magnitudes) {
-            let highFreqEnergy = 0;
-            let totalEnergy = 0;
-
-            for (let i = 0; i < magnitudes.length; i++) {
-                const freq = (i / magnitudes.length) * (SAMPLE_RATE / 2);
-                totalEnergy += magnitudes[i];
-
-                if (freq > 2000) {
-                    highFreqEnergy += magnitudes[i];
-                }
-            }
-
-            return totalEnergy > 0 ? Math.min(0.8, highFreqEnergy / totalEnergy) : 0;
-        }
-
-        // 粗糙度分析
-        function analyzeRoughness(magnitudes) {
-            let roughness = 0;
-
-            for (let i = 1; i < magnitudes.length - 1; i++) {
-                const variation = Math.abs(magnitudes[i] - magnitudes[i - 1]) +
-                    Math.abs(magnitudes[i] - magnitudes[i + 1]);
-                roughness += variation;
-            }
-
-            return Math.min(0.6, roughness / magnitudes.length);
-        }
-
-        function synthesizeAudio(magnitudes) {
-            const bufferLength = 2048; // 增加缓冲区长度获得更好的频率分辨率
-            const buffer = audioContext.createBuffer(1, bufferLength, SAMPLE_RATE);
-            const channelData = buffer.getChannelData(0);
-
-            // 分析频谱特征
-            const spectralFeatures = analyzeSpectrum(magnitudes);
-
-            if (spectralFeatures.fundamentalFreq === 0) {
-                return buffer; // 静音
-            }
-
-            // 猫叫声专用合成
-            for (let i = 0; i < bufferLength; i++) {
-                const t = i / SAMPLE_RATE;
-                let sample = 0;
-
-                // 1. 基频和谐波合成（猫叫声的音调核心）
-                const f0 = spectralFeatures.fundamentalFreq;
-                const harmonicSample = synthesizeHarmonics(f0, spectralFeatures.harmonics, t);
-                sample += harmonicSample * 0.7;
-
-                // 2. 共振峰合成（模拟猫的口腔共鸣）
-                const formantSample = synthesizeFormants(spectralFeatures.formants, t);
-                sample += formantSample * 0.4;
-
-                // 3. 噪声成分（气流声、摩擦声）
-                const noiseSample = synthesizeNoise(spectralFeatures.noiseLevel, spectralFeatures.spectralCentroid, t);
-                sample += noiseSample * 0.3;
-
-                // 4. 整体包络和动态处理
-                const envelope = getTimeEnvelope(t, bufferLength / SAMPLE_RATE);
-                sample *= envelope;
-
-                // 软限幅和最终处理
-                channelData[i] = Math.tanh(sample * 0.8) * 0.9;
-            }
-
-            return buffer;
-        }
-
-        // 分析频谱特征
-        function analyzeSpectrum(magnitudes) {
-            const features = {
-                fundamentalFreq: 0,
-                harmonics: [],
-                formants: [],
-                noiseLevel: 0,
-                spectralCentroid: 0
-            };
-
-            // 找到基频（最强的低频峰值）
-            let maxMag = 0;
-            let f0Index = 0;
-
-            // 在猫叫声典型范围内寻找基频 (100-1000Hz)
-            const minF0 = Math.floor(100 * magnitudes.length / (SAMPLE_RATE / 2));
-            const maxF0 = Math.floor(1000 * magnitudes.length / (SAMPLE_RATE / 2));
-
-            for (let i = minF0; i < maxF0; i++) {
-                if (magnitudes[i] > maxMag) {
-                    maxMag = magnitudes[i];
-                    f0Index = i;
-                }
-            }
-
-            if (maxMag > 0.1) {
-                features.fundamentalFreq = (f0Index / magnitudes.length) * (SAMPLE_RATE / 2);
-
-                // 找到谐波
-                for (let h = 2; h <= 8; h++) {
-                    const harmonicIndex = Math.round(f0Index * h);
-                    if (harmonicIndex < magnitudes.length) {
-                        features.harmonics.push({
-                            frequency: features.fundamentalFreq * h,
-                            amplitude: magnitudes[harmonicIndex]
-                        });
-                    }
-                }
-            }
-
-            // 找到共振峰（局部峰值，特别是在中频区域）
-            const formantRanges = [
-                [500, 1500],   // 第一共振峰
-                [1000, 3000],  // 第二共振峰
-                [2000, 4000]   // 第三共振峰
-            ];
-
-            for (const [minFreq, maxFreq] of formantRanges) {
-                const minIdx = Math.floor(minFreq * magnitudes.length / (SAMPLE_RATE / 2));
-                const maxIdx = Math.floor(maxFreq * magnitudes.length / (SAMPLE_RATE / 2));
-
-                let peakMag = 0;
-                let peakIdx = 0;
-
-                for (let i = minIdx; i < maxIdx; i++) {
-                    if (magnitudes[i] > peakMag) {
-                        peakMag = magnitudes[i];
-                        peakIdx = i;
-                    }
-                }
-
-                if (peakMag > 0.15) {
-                    features.formants.push({
-                        frequency: (peakIdx / magnitudes.length) * (SAMPLE_RATE / 2),
-                        amplitude: peakMag,
-                        bandwidth: 200 // 典型带宽
-                    });
-                }
-            }
-
-            // 计算噪声水平和频谱重心
-            let weightedSum = 0;
-            let totalMag = 0;
-            let highFreqSum = 0;
-
-            for (let i = 0; i < magnitudes.length; i++) {
-                const freq = (i / magnitudes.length) * (SAMPLE_RATE / 2);
-                weightedSum += freq * magnitudes[i];
-                totalMag += magnitudes[i];
-
-                if (freq > 2000) {
-                    highFreqSum += magnitudes[i];
-                }
-            }
-
-            features.spectralCentroid = totalMag > 0 ? weightedSum / totalMag : 0;
-            features.noiseLevel = highFreqSum / Math.max(1, magnitudes.length * 0.3);
-
-            return features;
-        }
-
-        // 合成谐波结构
-        function synthesizeHarmonics(f0, harmonics, t) {
-            if (f0 === 0) return 0;
-
-            let sample = 0;
-
-            // 基频
-            sample += Math.sin(2 * Math.PI * f0 * t) * 0.8;
-
-            // 谐波
-            for (const harmonic of harmonics) {
-                if (harmonic.amplitude > 0.05) {
-                    // 添加轻微的相位调制模拟声带的非线性
-                    const modulation = 1 + 0.02 * Math.sin(2 * Math.PI * 7 * t);
-                    const phase = 2 * Math.PI * harmonic.frequency * t * modulation;
-                    sample += Math.sin(phase) * harmonic.amplitude * 0.6;
-                }
-            }
-
-            return sample;
-        }
-
-        // 合成共振峰
-        function synthesizeFormants(formants, t) {
-            let sample = 0;
-
-            for (const formant of formants) {
-                // 使用带通滤波器的脉冲响应近似
-                const centerFreq = formant.frequency;
-                const bandwidth = formant.bandwidth;
-                const amplitude = formant.amplitude;
-
-                // 简化的共振峰合成：调制的正弦波
-                const carrier = Math.sin(2 * Math.PI * centerFreq * t);
-                const envelope = Math.exp(-bandwidth * t) * Math.cos(2 * Math.PI * bandwidth * 0.1 * t);
-
-                sample += carrier * envelope * amplitude * 0.3;
-            }
-
-            return sample;
-        }
-
-        // 合成噪声成分
-        function synthesizeNoise(noiseLevel, spectralCentroid, t) {
-            if (noiseLevel < 0.02) return 0;
-
-            // 生成有色噪声
-            let noise = (Math.random() - 0.5) * 2;
-
-            // 根据频谱重心调整噪声特性
-            if (spectralCentroid > 2000) {
-                // 高频重心：更多高频噪声（嘶嘶声）
-                noise = noise * (1 + Math.sin(2 * Math.PI * 3000 * t) * 0.3);
-            } else {
-                // 低频重心：更多低频噪声（呼吸声）
-                noise = noise * (1 + Math.sin(2 * Math.PI * 500 * t) * 0.2);
-            }
-
-            return noise * noiseLevel;
-        }
-
-        // 时间包络
-        function getTimeEnvelope(t, duration) {
-            // 猫叫声典型的包络：快速上升，缓慢衰减
-            const attack = 0.01;  // 10ms上升时间
-            const decay = 0.3;    // 300ms衰减时间
-
-            if (t < attack) {
-                return t / attack;
-            } else if (t < attack + decay) {
-                return Math.exp(-(t - attack) / (decay * 0.3));
-            } else {
-                return Math.exp(-(t - attack - decay) / (duration * 0.5)) * 0.3;
-            }
-        }
-
-        // 估计噪声水平
-        function getNoiseLevel(magnitudes) {
-            // 计算高频区域的平均能量（通常是噪声）
-            let highFreqSum = 0;
-            const startIdx = Math.floor(magnitudes.length * 0.7); // 从70%频率开始
-
-            for (let i = startIdx; i < magnitudes.length; i++) {
-                highFreqSum += magnitudes[i];
-            }
-
-            return highFreqSum / (magnitudes.length - startIdx);
-        }
-
-
-
-        function playAudioBuffer(buffer) {
-            if (isPlaying) return;
-
-            isPlaying = true;
-
-            const source = audioContext.createBufferSource();
-            source.buffer = buffer;
-
-            // 添加增益控制
-            const gainNode = audioContext.createGain();
-            gainNode.gain.setValueAtTime(0.6, audioContext.currentTime); // 稍微提高音量
-
-            source.connect(gainNode);
-            gainNode.connect(audioContext.destination);
-
-            source.onended = () => {
-                isPlaying = false;
-            };
-
-            source.start(0);
-
-            // 增加播放时间，减少断续感
-            setTimeout(() => {
-                try {
-                    // 更平滑的淡出
-                    gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.05);
-                    source.stop(audioContext.currentTime + 0.05);
-                } catch (e) { }
-                isPlaying = false;
-            }, 200); // 增加到200ms，减少断续感
-        }
-
-        function stopAudio() {
-            isPlaying = false;
-        }
-
-        // 绘制覆盖层
-        function drawOverlay() {
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-            // 简洁的UI设计：只在触摸时显示播放头
-            if (fingerPosition) {
-                // 简单的白色半透明播放头线
-                ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
-                ctx.lineWidth = 3;
-                ctx.beginPath();
-                ctx.moveTo(fingerPosition.x, 0);
-                ctx.lineTo(fingerPosition.x, canvas.height);
-                ctx.stroke();
-
-                // 播放头顶部小三角形
-                ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
-                ctx.beginPath();
-                ctx.moveTo(fingerPosition.x, 20);
-                ctx.lineTo(fingerPosition.x - 8, 5);
-                ctx.lineTo(fingerPosition.x + 8, 5);
-                ctx.closePath();
-                ctx.fill();
-            }
-        }
-
-        // 控制按钮事件
-        async function toggleCamera() {
-            // 切换前后摄像头
-            try {
-                const stream = camera.srcObject;
-                const tracks = stream.getVideoTracks();
-                tracks.forEach(track => track.stop());
-
-                const currentFacingMode = tracks[0].getSettings().facingMode;
-                const newFacingMode = currentFacingMode === 'environment' ? 'user' : 'environment';
-
-                const newStream = await navigator.mediaDevices.getUserMedia({
-                    video: { facingMode: newFacingMode }
-                });
-
-                camera.srcObject = newStream;
-                await camera.play();
-
-                resizeCanvas();
-
-            } catch (error) {
-                console.error('切换摄像头失败:', error);
-            }
-        }
-
-        function recalibrate() {
-            spectrogramRect = null;
-            spectrogramData = null;
-            updateInfo('重新校准中，请对准频谱图', 'searching');
-        }
-
-        function toggleDebug() {
-            const isVisible = debugPanel.style.display !== 'none';
-            debugPanel.style.display = isVisible ? 'none' : 'block';
-        }
-
-        // 启动应用
-        init();
-    </script>
+          }
+          if(area>best.area){ best={area,cx:cx/Math.max(1,area),cy:cy/Math.max(1,area)}; }
+        }
+      }
+    }
+    return best.area? {x:best.cx,y:best.cy}: null;
+  }
+  const c1=search(0,0, W/3, H/3);             // 左上
+  const c2=search(W*2/3,0, W/3, H/3);         // 右上
+  const c3=search(0,H*2/3, W/3, H/3);         // 左下
+  const c4=search(W*2/3,H*2/3, W/3, H/3);     // 右下
+  if(c1&&c2&&c3&&c4) return [c1,c2,c3,c4];
+  return null;
+}
+// 求单应矩阵 H (3x3)，把 src 四点映射到标准矩形 (0,0)-(W,H)
+function getHomography(p){ // p: [tl,tr,bl,br]
+  function mat3Inv(m){ const a=m, b=new Float64Array(9);
+    const A=a[0],B=a[1],C=a[2],D=a[3],E=a[4],F=a[5],G=a[6],Hh=a[7],I=a[8];
+    const det=A*(E*I-F*Hh)-B*(D*I-F*G)+C*(D*Hh-E*G);
+    b[0]=(E*I-F*Hh)/det; b[1]=(C*Hh-B*I)/det; b[2]=(B*F-C*E)/det;
+    b[3]=(F*G-D*I)/det;  b[4]=(A*I-C*G)/det;  b[5]=(C*D-A*F)/det;
+    b[6]=(D*Hh-E*G)/det; b[7]=(B*G-A*Hh)/det; b[8]=(A*E-B*D)/det; return b;
+  }
+  const [tl,tr,bl,br]=p;
+  const src=[tl.x,tl.y, tr.x,tr.y, bl.x,bl.y, br.x,br.y];
+  const dst=[0,0, W,0, 0,H, W,H];
+  // 直接解八元一次：参见常规模板
+  function solveH(s,d){
+    const [x0,y0,x1,y1,x2,y2,x3,y3]=s, [X0,Y0,X1,Y1,X2,Y2,X3,Y3]=d;
+    const M=[
+      x0,y0,1, 0,0,0, -X0*x0,-X0*y0,
+      0,0,0, x0,y0,1, -Y0*x0,-Y0*y0,
+      x1,y1,1, 0,0,0, -X1*x1,-X1*y1,
+      0,0,0, x1,y1,1, -Y1*x1,-Y1*y1,
+      x2,y2,1, 0,0,0, -X2*x2,-X2*y2,
+      0,0,0, x2,y2,1, -Y2*x2,-Y2*y2,
+      x3,y3,1, 0,0,0, -X3*x3,-X3*y3,
+      0,0,0, x3,y3,1, -Y3*x3,-Y3*y3
+    ];
+    const B=[X0,Y0,X1,Y1,X2,Y2,X3,Y3];
+    // 解 8x8（高斯消元）
+    const A=new Float64Array(64); for(let i=0;i<64;i++) A[i]=M[i];
+    const bb=new Float64Array(8); for(let i=0;i<8;i++) bb[i]=B[i];
+    for(let i=0;i<8;i++){
+      // 选主元
+      let piv=i, pv=Math.abs(A[i*8+i]);
+      for(let r=i+1;r<8;r++){ const v=Math.abs(A[r*8+i]); if(v>pv){pv=v;piv=r;} }
+      if(piv!==i){ for(let c=i;c<8;c++){ [A[i*8+c],A[piv*8+c]]=[A[piv*8+c],A[i*8+c]]; } [bb[i],bb[piv]]=[bb[piv],bb[i]]; }
+      const d=A[i*8+i]; for(let c=i;c<8;c++) A[i*8+c]/=d; bb[i]/=d;
+      for(let r=0;r<8;r++) if(r!==i){ const mul=A[r*8+i]; for(let c=i;c<8;c++) A[r*8+c]-=mul*A[i*8+c]; bb[r]-=mul*bb[i]; }
+    }
+    const h=new Float64Array(9); for(let i=0;i<8;i++) h[i]=bb[i]; h[8]=1;
+    return h;
+  }
+  return solveH([p[0].x,p[0].y,p[1].x,p[1].y,p[2].x,p[2].y,p[3].x,p[3].y],[0,0,W,0,0,H,W,H]);
+}
+// 逆变换采样
+function warpToCanonical(srcImg,W0,H0,Hm){
+  const dst = new ImageData(W,H); const d=dst.data, s=srcImg.data;
+  // 先求逆矩阵
+  const h=Hm, inv=(function(){
+    const a=new Float64Array([h[0],h[1],h[2],h[3],h[4],h[5],h[6],h[7],h[8]]);
+    // 3x3 逆
+    const A=a[0],B=a[1],C=a[2],D=a[3],E=a[4],F=a[5],G=a[6],H=a[7],I=a[8];
+    const det=A*(E*I-F*H)-B*(D*I-F*G)+C*(D*H-E*G);
+    return new Float64Array([
+      (E*I-F*H)/det, (C*H-B*I)/det, (B*F-C*E)/det,
+      (F*G-D*I)/det, (A*I-C*G)/det, (C*D-A*F)/det,
+      (D*H-E*G)/det, (B*G-A*H)/det, (A*E-B*D)/det
+    ]);
+  })();
+  function bilinear(x,y){
+    const x0=Math.floor(x), y0=Math.floor(y), x1=Math.min(W0-1,x0+1), y1=Math.min(H0-1,y0+1);
+    const a=x-x0, b=y-y0;
+    const i00=(y0*W0+x0)*4, i10=(y0*W0+x1)*4, i01=(y1*W0+x0)*4, i11=(y1*W0+x1)*4;
+    function lerp(i0,i1,t){ return [ s[i0]*(1-t)+s[i1]*t, s[i0+1]*(1-t)+s[i1+1]*t, s[i0+2]*(1-t)+s[i1+2]*t, 255 ]; }
+    const r0=lerp(i00,i10,a), r1=lerp(i01,i11,a);
+    return [ r0[0]*(1-b)+r1[0]*b, r0[1]*(1-b)+r1[1]*b, r0[2]*(1-b)+r1[2]*b, 255 ];
+  }
+  for(let y=0;y<H;y++){
+    for(let x=0;x<W;x++){
+      const X=inv[0]*x+inv[1]*y+inv[2], Y=inv[3]*x+inv[4]*y+inv[5], Z=inv[6]*x+inv[7]*y+inv[8];
+      const sx=X/Z, sy=Y/Z;
+      if(sx>=0&&sx<W0&&sy>=0&&sy<H0){
+        const px=bilinear(sx,sy), idx=(y*W+x)*4; d[idx]=px[0]; d[idx+1]=px[1]; d[idx+2]=px[2]; d[idx+3]=255;
+      }
+    }
+  }
+  return dst;
+}
+
+/* 从规范图提取：导引条相位 + 频谱矩阵（下采样到 K=256, C=384） */
+function extractFromCanonical(img){
+  const data=img.data;
+  // 1) 频谱矩阵（灰度→强度，0..1；黑=强）
+  const C=384, K=256; // 下采样以减轻 CPU
+  const cols=new Float32Array(C*K); // 按列存储，便于 Worklet 插值
+  for(let cx=0; cx<C; cx++){
+    const x = Math.round(cx*(W-1)/(C-1));
+    for(let ky=0; ky<K; ky++){
+      const y = H_PILOT + Math.round( (H_SPEC-1) - ky*(H_SPEC-1)/(K-1) );
+      const idx=(y*W+x)*4;
+      const g = 0.2126*data[idx]+0.7152*data[idx+1]+0.0722*data[idx+2];
+      const t = 1 - (g/255); // 黑→1
+      // 轻量去噪
+      const A = Math.pow(Math.max(0,t), 1.2);
+      cols[cx*K + ky] = A * (ky/K); // 高频稍降权，减电子味
+    }
+  }
+  // 2) 导引条：正弦条纹相位
+  // 参考信号 sin/cos
+  let I=0,Q=0; // 积分相关
+  for(let x=0;x<W;x++){
+    const idx=(Math.floor(H_PILOT/2)*W + x)*4;
+    const g=0.2126*data[idx]+0.7152*data[idx+1]+0.0722*data[idx+2];
+    const d = 1 - (g/255); // 黑为正
+    const cs=Math.cos(2*Math.PI*x/LAMBDA), sn=Math.sin(2*Math.PI*x/LAMBDA);
+    I += d*cs; Q += d*sn;
+  }
+  const phi = Math.atan2(Q,I); // [-π,π]
+  return {cols, C, K, phi};
+}
+
+/* 位置/速度估计（相位解包 + 平滑） */
+let lastPhi=null, unwrap=0, lastT=0, xNorm=0, vNorm=0; // x/v 用「列」为单位
+function updatePhase(phi, dt){
+  if(lastPhi==null){ lastPhi=phi; lastT=performance.now()*0.001; return; }
+  // 解包：把相位差约束到 [-π,π] 再累计
+  let dphi = phi - lastPhi;
+  while(dphi>Math.PI) dphi-=2*Math.PI;
+  while(dphi<-Math.PI) dphi+=2*Math.PI;
+  unwrap += dphi;
+  lastPhi = phi;
+  const dx_pixels = unwrap * (LAMBDA/(2*Math.PI)); // 相位→像素位移
+  // 像素→列（W 对应 C 列）
+  xNorm = (dx_pixels / W) * specC; // specC 稍后设
+  // 速度（列/秒），指数平滑
+  const v = (dphi/(2*Math.PI)) * (LAMBDA/dt) / W * specC;
+  vNorm = 0.85*vNorm + 0.15*v;
+}
+
+/* 主循环 */
+let specC=384, specK=256, haveSpec=false;
+(async function start(){
+  try{
+    const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment', width:{ideal:1280}, height:{ideal:720}}});
+    cam.srcObject=s; await cam.play();
+    capCv=document.createElement('canvas'); capCv.width=cam.videoWidth||1280; capCv.height=cam.videoHeight||720; capCtx=capCv.getContext('2d',{willReadFrequently:true});
+    loop();
+  }catch(e){ alert('相机启动失败，请在 HTTPS 下授权相机'); }
+})();
+
+let lastTimePerf=performance.now();
+async function loop(){
+  capCtx.drawImage(cam,0,0,capCv.width,capCv.height);
+  const img=capCtx.getImageData(0,0,capCv.width,capCv.height);
+  // 找角点
+  const cs=findCorners(img,capCv.width,capCv.height);
+  if(cs){
+    frame.className='green';
+    // 排成 tl,tr,bl,br
+    const tl=cs[0], tr=cs[1], bl=cs[2], br=cs[3];
+    const Hm=getHomography([tl,tr,bl,br]);
+    const can=warpToCanonical(img,capCv.width,capCv.height,Hm); // 变到 1024×640
+    // 提取频谱矩阵 & 相位
+    const {cols,C,K,phi}=extractFromCanonical(can);
+    specC=C; specK=K;
+    if(!haveSpec){
+      await ensureAudio();
+      node.port.postMessage({t:'spec', K:specK, C:specC, data:cols});
+      haveSpec=true; unwrap=0; lastPhi=null; xNorm=0; vNorm=0;
+    }else{
+      // 只在首次发送矩阵，之后可选每几帧增量刷新；这儿简单起见每帧整块刷新（矩阵小，OK）
+      node.port.postMessage({t:'spec', K:specK, C:specC, data:cols});
+    }
+    // 相位更新 → 位置/速度
+    const now=performance.now(); const dt=Math.max(1, now-lastTimePerf)/1000; lastTimePerf=now;
+    updatePhase(phi, dt);
+    // 速度门限（太慢≈静音）
+    const v1x = specC / DUR; // 1× 速度（列/秒）
+    const gain = Math.max(0, Math.min(1, Math.abs(vNorm)/(0.35*v1x)));
+    const dxPerSample = (vNorm/specC) * (specC/DUR) / SR * specC; // 简化：按列/秒 → 每样本位移的列数
+    node.port.postMessage({t:'state', x:Math.max(0,Math.min(specC-1,xNorm)), dx:dxPerSample, g:gain});
+    drawUI(can, xNorm/specC);
+  }else{
+    frame.className='white';
+    haveSpec=false;
+  }
+  requestAnimationFrame(loop);
+}
+
+/* 叠加 UI（播放竖线） */
+function drawUI(can, x01){
+  ui.width=innerWidth; ui.height=innerHeight;
+  const ctx=ui.getContext('2d'); ctx.clearRect(0,0,ui.width,ui.height);
+  // 把 canonical 的竖线映射回屏幕（近似按 video 尺寸等比铺满）
+  const r=cam.getBoundingClientRect(); // 屏幕上的 video 矩形
+  const x = Math.round(r.left + x01 * r.width);
+  ctx.strokeStyle='rgba(255,255,255,.95)'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(x, r.top); ctx.lineTo(x, r.top + r.height); ctx.stroke();
+}
+</script>
 </body>
-
 </html>
