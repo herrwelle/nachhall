@@ -217,6 +217,11 @@
         let isAutoPlaying = false;
         let autoPlayTimer = null;
 
+        // 自动播放相关变量
+        let autoPlayPosition = 0;
+        let autoPlaySpeed = 0.02; // 每帧移动的位置（调整播放速度）
+        let autoPlayActive = false;
+
         let frameCount = 0;
         let lastFpsTime = 0;
 
@@ -360,8 +365,11 @@
                 if (!spectrogramRect || rectChanged(spectrogramRect, detectedRect)) {
                     spectrogramRect = detectedRect;
                     spectrogramData = extractSpectrogramData(imageData, detectedRect);
-                    updateInfo('频谱图检测成功，请用手指滑动播放', 'found');
+                    updateInfo('频谱图检测成功，自动播放中...', 'found');
                     updateDebug(`${detectedRect.width}x${detectedRect.height}`, fingerPosition ? `${fingerPosition.x.toFixed(0)},${fingerPosition.y.toFixed(0)}` : '无', audioContext ? '就绪' : '未初始化');
+
+                    // 启动自动播放
+                    startAutoPlay();
                 }
             } else {
                 if (spectrogramRect) {
@@ -504,7 +512,7 @@
             const { x, y, width: rectWidth, height: rectHeight } = rect;
 
             const spectData = [];
-            const timeSteps = 200;
+            const timeSteps = 500; // 与编码器一致，支持16秒
             const freqSteps = 513;
 
             console.log(`提取增强频谱数据: ${timeSteps}x${freqSteps}`);
@@ -653,6 +661,14 @@
             fingerHistory = [];
 
             stopAudio();
+
+            // 如果没有手指操作，重新启动自动播放
+            setTimeout(() => {
+                if (!fingerPosition && spectrogramData && autoPlayActive === false) {
+                    startAutoPlay();
+                }
+            }, 1000); // 1秒后重新开始自动播放
+
             updateDebug(
                 spectrogramRect ? `${spectrogramRect.width}x${spectrogramRect.height}` : '无',
                 '无',
@@ -806,6 +822,78 @@
             isAutoPlaying = false;
         }
 
+        // 自动播放功能
+        function startAutoPlay() {
+            if (autoPlayActive || !spectrogramData) return;
+
+            autoPlayActive = true;
+            autoPlayPosition = 0;
+
+            // 初始化音频上下文
+            if (!audioContext) {
+                initAudioContext();
+            }
+
+            console.log('开始自动播放16秒音频');
+
+            const autoPlayInterval = setInterval(() => {
+                if (!spectrogramData || !autoPlayActive) {
+                    clearInterval(autoPlayInterval);
+                    autoPlayActive = false;
+                    return;
+                }
+
+                // 如果用户开始手动操作，停止自动播放
+                if (fingerPosition) {
+                    clearInterval(autoPlayInterval);
+                    autoPlayActive = false;
+                    console.log('用户开始手动操作，停止自动播放');
+                    return;
+                }
+
+                // 播放当前位置
+                if (!isPlaying) {
+                    playAtPositionSmooth(autoPlayPosition);
+                }
+
+                // 更新播放位置
+                autoPlayPosition += autoPlaySpeed;
+
+                // 循环播放
+                if (autoPlayPosition >= 1.0) {
+                    autoPlayPosition = 0;
+                    console.log('自动播放循环重新开始');
+                }
+
+                // 更新虚拟手指位置用于显示播放头
+                if (spectrogramRect) {
+                    const videoRect = camera.getBoundingClientRect();
+                    const scaleX = videoRect.width / captureCanvas.width;
+                    const spectScreenX = videoRect.left + spectrogramRect.x * scaleX;
+                    const spectScreenWidth = spectrogramRect.width * scaleX;
+
+                    // 创建虚拟手指位置
+                    const virtualX = spectScreenX + autoPlayPosition * spectScreenWidth;
+                    const virtualY = videoRect.top + videoRect.height / 2;
+
+                    // 更新显示用的手指位置
+                    if (!fingerPosition) {
+                        fingerPosition = { x: virtualX, y: virtualY };
+                    } else {
+                        fingerPosition.x = virtualX;
+                        fingerPosition.y = virtualY;
+                    }
+                }
+
+            }, 100); // 10fps的自动播放
+        }
+
+        function stopAutoPlay() {
+            autoPlayActive = false;
+            autoPlayPosition = 0;
+            console.log('停止自动播放');
+        }
+
         function playAtPositionSmooth(position) {
             if (!audioContext || !spectrogramData || isPlaying) return;
 
@@ -854,58 +942,86 @@
 
         // 增强的音频合成，利用编码的额外信息
         function synthesizeAudioEnhanced(frameData) {
-            const bufferLength = 2048;
+            const bufferLength = 4096; // 增加缓冲区长度，减少断续感
             const buffer = audioContext.createBuffer(1, bufferLength, SAMPLE_RATE);
             const channelData = buffer.getChannelData(0);
 
             const magnitudes = frameData.magnitudes;
-            const phaseHints = frameData.phaseHints;
-            const harmonicHints = frameData.harmonicHints;
 
-            // 更直接的频谱合成方法
+            // 找到主要频率成分
+            const dominantFreqs = findDominantFrequencies(magnitudes, 8);
+
+            // 生成更连续的音频
             for (let i = 0; i < bufferLength; i++) {
                 const t = i / SAMPLE_RATE;
                 let sample = 0;
 
-                // 直接从频谱重建，利用相位提示
-                for (let f = 1; f < magnitudes.length && f < 200; f++) { // 限制频率范围
-                    const magnitude = magnitudes[f];
-                    if (magnitude > 0.02) {
-                        const frequency = (f / magnitudes.length) * (SAMPLE_RATE / 2);
+                // 基于主要频率合成
+                for (const freq of dominantFreqs) {
+                    const frequency = freq.frequency;
+                    const amplitude = freq.amplitude;
 
-                        // 使用相位提示
-                        const phaseOffset = phaseHints[f] * Math.PI * 2;
+                    if (frequency > 80 && frequency < 4000) {
+                        // 基础音调
+                        let tone = Math.sin(2 * Math.PI * frequency * t);
 
-                        // 谐波增强
-                        const harmonicBoost = 1 + harmonicHints[f] * 0.5;
+                        // 添加轻微的调制让声音更自然
+                        const vibrato = 1 + 0.03 * Math.sin(2 * Math.PI * 6 * t);
+                        tone = Math.sin(2 * Math.PI * frequency * vibrato * t);
 
-                        // 频率权重（偏好猫叫声频率范围）
-                        let freqWeight = 1.0;
-                        if (frequency >= 200 && frequency <= 2000) {
-                            freqWeight = 1.5; // 增强主要频率范围
-                        } else if (frequency > 4000) {
-                            freqWeight = 0.3; // 减少高频
+                        // 添加谐波丰富度
+                        if (frequency * 2 < SAMPLE_RATE / 2) {
+                            tone += 0.3 * Math.sin(2 * Math.PI * frequency * 2 * t);
+                        }
+                        if (frequency * 3 < SAMPLE_RATE / 2) {
+                            tone += 0.15 * Math.sin(2 * Math.PI * frequency * 3 * t);
                         }
 
-                        const phase = 2 * Math.PI * frequency * t + phaseOffset;
-                        sample += magnitude * harmonicBoost * freqWeight * Math.sin(phase) * 0.3;
+                        sample += amplitude * tone * 0.4;
                     }
                 }
 
-                // 添加轻微的噪声纹理
+                // 添加适量的噪声纹理
                 const noiseLevel = calculateNoiseLevel(magnitudes);
-                if (noiseLevel > 0.02) {
-                    sample += (Math.random() - 0.5) * noiseLevel * 0.1;
+                if (noiseLevel > 0.03) {
+                    const noise = (Math.random() - 0.5) * 2;
+                    // 高通滤波噪声
+                    const filteredNoise = noise - (noise * 0.7);
+                    sample += filteredNoise * noiseLevel * 0.08;
                 }
 
-                // 动态包络
-                const envelope = Math.exp(-t * 3) * (1 + 0.2 * Math.sin(2 * Math.PI * 8 * t));
+                // 更平滑的包络
+                const envelope = 1.0 - Math.exp(-t * 10); // 快速上升
                 sample *= envelope;
 
-                channelData[i] = Math.tanh(sample * 1.2) * 0.7;
+                // 软限幅
+                channelData[i] = Math.tanh(sample * 0.9) * 0.8;
             }
 
             return buffer;
+        }
+
+        // 找到主要频率成分
+        function findDominantFrequencies(magnitudes, count) {
+            const frequencies = [];
+
+            // 找到所有显著的频率峰值
+            for (let i = 2; i < magnitudes.length - 2; i++) {
+                const magnitude = magnitudes[i];
+                if (magnitude > 0.05 &&
+                    magnitude > magnitudes[i - 1] &&
+                    magnitude > magnitudes[i + 1] &&
+                    magnitude > magnitudes[i - 2] &&
+                    magnitude > magnitudes[i + 2]) {
+
+                    const frequency = (i / magnitudes.length) * (SAMPLE_RATE / 2);
+                    frequencies.push({ frequency, amplitude: magnitude });
+                }
+            }
+
+            // 按幅度排序，取前N个
+            frequencies.sort((a, b) => b.amplitude - a.amplitude);
+            return frequencies.slice(0, count);
         }
 
         function calculateNoiseLevel(magnitudes) {
@@ -1152,7 +1268,7 @@
 
             // 添加增益控制
             const gainNode = audioContext.createGain();
-            gainNode.gain.setValueAtTime(0.5, audioContext.currentTime); // 控制音量
+            gainNode.gain.setValueAtTime(0.6, audioContext.currentTime); // 稍微提高音量
 
             source.connect(gainNode);
             gainNode.connect(audioContext.destination);
@@ -1163,15 +1279,15 @@
 
             source.start(0);
 
-            // 使用更短的播放时间，更快的响应
+            // 增加播放时间，减少断续感
             setTimeout(() => {
                 try {
-                    // 淡出效果
-                    gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.02);
-                    source.stop(audioContext.currentTime + 0.02);
+                    // 更平滑的淡出
+                    gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.05);
+                    source.stop(audioContext.currentTime + 0.05);
                 } catch (e) { }
                 isPlaying = false;
-            }, 60); // 减少到60ms
+            }, 200); // 增加到200ms，减少断续感
         }
 
         function stopAudio() {
