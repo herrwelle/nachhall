@@ -1034,95 +1034,153 @@
 
         // 备用合成方法
         function synthesizeAudioFallback(frameData) {
-            console.log('使用IFFT音频重建方法');
+            console.log('使用源-滤波器模型合成');
             const bufferLength = 2048;
             const buffer = audioContext.createBuffer(1, bufferLength, SAMPLE_RATE);
             const channelData = buffer.getChannelData(0);
 
             const magnitudes = frameData.magnitudes;
-            const phases = frameData.phases || new Float32Array(magnitudes.length);
 
-            // 使用逆FFT重建音频信号
-            const fftSize = 1024;
-            const realPart = new Float32Array(fftSize);
-            const imagPart = new Float32Array(fftSize);
-
-            // 构建复数频谱
-            for (let f = 0; f < Math.min(fftSize / 2, magnitudes.length); f++) {
-                const magnitude = magnitudes[f];
-                const phase = phases[f];
-
-                // 转换为复数形式
-                realPart[f] = magnitude * Math.cos(phase);
-                imagPart[f] = magnitude * Math.sin(phase);
-
-                // 镜像对称（实信号的要求）
-                if (f > 0 && f < fftSize / 2) {
-                    realPart[fftSize - f] = realPart[f];
-                    imagPart[fftSize - f] = -imagPart[f];
-                }
+            // 1. 分析频谱特征，提取稳定的基频
+            const fundamentalFreq = extractStableFundamental(magnitudes);
+            if (fundamentalFreq < 100 || fundamentalFreq > 1000) {
+                console.log('基频异常:', fundamentalFreq, '使用默认值');
+                return generateSilence(bufferLength);
             }
 
-            // 执行IFFT重建时域信号
-            const timeSignal = performIFFT(realPart, imagPart, fftSize);
+            // 2. 分析共振峰（formants）
+            const formants = extractFormants(magnitudes);
 
-            // 将重建的信号复制到输出缓冲区
+            // 3. 计算总体能量
+            const totalEnergy = magnitudes.reduce((sum, mag) => sum + mag * mag, 0);
+            if (totalEnergy < 0.01) {
+                return generateSilence(bufferLength);
+            }
+
+            console.log(`合成参数: F0=${fundamentalFreq.toFixed(1)}Hz, 共振峰:`, formants.map(f => f.toFixed(0)));
+
+            // 4. 源-滤波器合成
             for (let i = 0; i < bufferLength; i++) {
                 const t = i / SAMPLE_RATE;
-                let sample = 0;
 
-                // 从IFFT结果中采样
-                if (i < timeSignal.length) {
-                    sample = timeSignal[i];
-                } else {
-                    // 循环播放或衰减
-                    const loopIndex = i % timeSignal.length;
-                    const decay = Math.exp(-(i - timeSignal.length) / (SAMPLE_RATE * 0.1));
-                    sample = timeSignal[loopIndex] * decay;
+                // 源信号：基频 + 谐波
+                let source = 0;
+                const f0 = fundamentalFreq;
+
+                // 基频和前8个谐波
+                for (let harmonic = 1; harmonic <= 8; harmonic++) {
+                    const freq = f0 * harmonic;
+                    if (freq > SAMPLE_RATE / 2) break;
+
+                    // 谐波幅度衰减：1/n^0.7 (更自然的衰减)
+                    const amplitude = Math.pow(harmonic, -0.7);
+
+                    // 添加轻微的相位噪声模拟自然变化
+                    const phaseNoise = 0.1 * Math.sin(2 * Math.PI * 7 * t) * Math.random();
+
+                    source += amplitude * Math.sin(2 * Math.PI * freq * t + phaseNoise);
                 }
 
-                // 添加轻微的自然纹理
-                const textureNoise = (Math.random() - 0.5) * 0.02;
-                sample += textureNoise;
+                // 滤波器：共振峰滤波
+                let filtered = source;
+                for (const formantFreq of formants) {
+                    // 简化的共振峰增强
+                    const resonance = 1 + 0.3 * Math.exp(-Math.pow((f0 - formantFreq) / (formantFreq * 0.1), 2));
+                    filtered *= resonance;
+                }
+
+                // 添加适量的噪声成分（气流声）
+                const noiseLevel = Math.sqrt(totalEnergy) * 0.05;
+                const noise = (Math.random() - 0.5) * 2 * noiseLevel;
+                filtered += noise;
 
                 // 自然包络
                 let envelope = 1.0;
-                if (t < 0.002) {
-                    envelope = t / 0.002; // 2ms攻击
-                } else if (t > bufferLength / SAMPLE_RATE * 0.7) {
-                    const fadeStart = bufferLength / SAMPLE_RATE * 0.7;
-                    const fadeLength = bufferLength / SAMPLE_RATE * 0.3;
-                    envelope = Math.exp(-(t - fadeStart) / (fadeLength * 0.4));
+                const duration = bufferLength / SAMPLE_RATE;
+                if (t < 0.003) {
+                    envelope = t / 0.003; // 3ms攻击
+                } else if (t > duration * 0.8) {
+                    const fadeStart = duration * 0.8;
+                    const fadeLength = duration * 0.2;
+                    envelope = Math.exp(-(t - fadeStart) / (fadeLength * 0.3));
                 }
 
-                sample *= envelope;
-                channelData[i] = Math.tanh(sample * 1.2) * 0.6;
+                // 应用包络和总体音量
+                const volume = Math.sqrt(totalEnergy) * 0.4;
+                filtered *= envelope * volume;
+
+                // 软限制
+                channelData[i] = Math.tanh(filtered * 0.8) * 0.7;
             }
 
             return buffer;
         }
 
-        // 简化的IFFT实现
-        function performIFFT(realPart, imagPart, size) {
-            const result = new Float32Array(size);
+        // 提取稳定的基频
+        function extractStableFundamental(magnitudes) {
+            const candidates = [];
 
-            for (let n = 0; n < size; n++) {
-                let realSum = 0;
-                let imagSum = 0;
+            // 在猫叫声的典型基频范围内寻找峰值
+            const minF0 = 150; // Hz
+            const maxF0 = 800; // Hz
+            const minBin = Math.floor(minF0 * magnitudes.length * 2 / SAMPLE_RATE);
+            const maxBin = Math.floor(maxF0 * magnitudes.length * 2 / SAMPLE_RATE);
 
-                for (let k = 0; k < size; k++) {
-                    const angle = 2 * Math.PI * k * n / size;
-                    const cosAngle = Math.cos(angle);
-                    const sinAngle = Math.sin(angle);
+            for (let i = minBin; i < Math.min(maxBin, magnitudes.length - 2); i++) {
+                if (magnitudes[i] > 0.1 &&
+                    magnitudes[i] > magnitudes[i - 1] &&
+                    magnitudes[i] > magnitudes[i + 1]) {
 
-                    realSum += realPart[k] * cosAngle - imagPart[k] * sinAngle;
-                    imagSum += realPart[k] * sinAngle + imagPart[k] * cosAngle;
+                    const freq = (i / magnitudes.length) * (SAMPLE_RATE / 2);
+                    candidates.push({ freq, magnitude: magnitudes[i] });
                 }
-
-                result[n] = realSum / size; // 只取实部
             }
 
-            return result;
+            if (candidates.length === 0) return 300; // 默认基频
+
+            // 选择最强的候选基频
+            candidates.sort((a, b) => b.magnitude - a.magnitude);
+            return candidates[0].freq;
+        }
+
+        // 提取共振峰
+        function extractFormants(magnitudes) {
+            const formants = [];
+
+            // 猫叫声的典型共振峰范围
+            const formantRanges = [
+                [400, 1200],   // F1
+                [1000, 2500],  // F2
+                [2000, 4000]   // F3
+            ];
+
+            for (const [minF, maxF] of formantRanges) {
+                const minBin = Math.floor(minF * magnitudes.length * 2 / SAMPLE_RATE);
+                const maxBin = Math.floor(maxF * magnitudes.length * 2 / SAMPLE_RATE);
+
+                let maxMag = 0;
+                let maxBin_idx = minBin;
+
+                for (let i = minBin; i < Math.min(maxBin, magnitudes.length); i++) {
+                    if (magnitudes[i] > maxMag) {
+                        maxMag = magnitudes[i];
+                        maxBin_idx = i;
+                    }
+                }
+
+                if (maxMag > 0.05) {
+                    const formantFreq = (maxBin_idx / magnitudes.length) * (SAMPLE_RATE / 2);
+                    formants.push(formantFreq);
+                }
+            }
+
+            return formants.length > 0 ? formants : [800, 1600, 2800]; // 默认共振峰
+        }
+
+        // 生成静音
+        function generateSilence(bufferLength) {
+            const buffer = audioContext.createBuffer(1, bufferLength, SAMPLE_RATE);
+            return buffer;
         }
 
         // 找到主要频率成分
