@@ -602,6 +602,7 @@
         async function startFingerTracking(x, y) {
             console.log('开始手指跟踪:', x, y);
 
+            // 固定Y坐标为初始触摸位置，只允许X方向移动控制播放
             fingerPosition = { x, y };
             lastFingerTime = performance.now();
 
@@ -615,40 +616,48 @@
             fingerTrail.style.left = (x - 10) + 'px';
             fingerTrail.style.top = (y - 10) + 'px';
 
+            console.log('固定Y坐标为:', y, '只响应X方向移动');
             updateFingerPosition(x, y);
         }
 
         function updateFingerPosition(x, y) {
             if (!fingerPosition) return;
 
+            // 只更新X坐标，Y坐标保持初始值（避免上下移动影响播放）
+            const deltaX = x - fingerPosition.x;
             fingerPosition.x = x;
-            fingerPosition.y = y;
+            // fingerPosition.y 保持不变，只用于显示
             lastFingerTime = performance.now();
 
-            // 更新手指轨迹显示
+            // 更新手指轨迹显示（视觉反馈）
             fingerTrail.style.left = (x - 10) + 'px';
             fingerTrail.style.top = (y - 10) + 'px';
 
-            // 添加到滑动历史
-            addToFingerHistory(x, y);
+            // 只记录X方向的移动历史
+            addToFingerHistory(x, fingerPosition.y);
 
-            // 计算平滑位置和播放速度
+            // 计算平滑播放（只基于X方向移动）
             updateSmoothPlayback();
 
-            console.log('手指位置更新:', x, y);
+            console.log('手指X位置更新:', x, '移动量:', deltaX);
 
-            // 计算在频谱图中的位置
-            const spectPosition = screenToSpectrogramCoords(x, y);
+            // 只使用X坐标计算频谱图位置（Y坐标使用初始位置）
+            const spectPosition = screenToSpectrogramCoords(x, fingerPosition.y);
             if (spectPosition) {
-                console.log('频谱位置:', spectPosition.x);
-                playAtPosition(spectPosition.x);
+                console.log('频谱X位置:', spectPosition.x);
+
+                // 只有当X方向有明显移动时才播放
+                if (Math.abs(deltaX) > 2) {
+                    playAtPosition(spectPosition.x);
+                }
+
                 updateDebug(
                     `${spectrogramRect.width}x${spectrogramRect.height}`,
                     `${spectPosition.x.toFixed(2)}`,
                     isPlaying ? '播放中' : '就绪'
                 );
             } else {
-                console.log('手指不在频谱图范围内');
+                console.log('手指不在频谱图X范围内');
             }
         }
 
@@ -739,39 +748,48 @@
             if (fingerHistory.length < 2) return;
 
             const now = performance.now();
-            const recentHistory = fingerHistory.filter(point => now - point.timestamp < 200);
+            const recentHistory = fingerHistory.filter(point => now - point.timestamp < 150);
 
             if (recentHistory.length < 2) return;
 
-            // 计算平均速度
-            let totalDistance = 0;
+            // 只计算X方向的移动速度
+            let totalXDistance = 0;
             let totalTime = 0;
+            let direction = 0; // 1为向右，-1为向左
 
             for (let i = 1; i < recentHistory.length; i++) {
                 const prev = recentHistory[i - 1];
                 const curr = recentHistory[i];
-                const distance = Math.abs(curr.x - prev.x);
+                const xDistance = curr.x - prev.x; // 保持方向信息
                 const time = curr.timestamp - prev.timestamp;
 
-                if (time > 0) {
-                    totalDistance += distance;
+                if (time > 0 && Math.abs(xDistance) > 1) { // 过滤微小移动
+                    totalXDistance += Math.abs(xDistance);
                     totalTime += time;
+                    direction += Math.sign(xDistance);
                 }
             }
 
-            if (totalTime > 0) {
-                const avgSpeed = totalDistance / totalTime; // 单位：position/ms
+            if (totalTime > 0 && totalXDistance > 5) { // 确保有足够的移动距离
+                const avgSpeed = totalXDistance / totalTime; // X方向速度
+                direction = Math.sign(direction); // 主要移动方向
 
-                // 计算目标播放速度（正常速度的倍数）
-                const normalSpeed = 0.001; // 正常滑动速度基准
-                playbackSpeed = Math.max(0.1, Math.min(3.0, avgSpeed / normalSpeed));
+                // 只有向右移动时才辅助播放
+                if (direction > 0) {
+                    const normalSpeed = 0.5; // 调整基准速度
+                    playbackSpeed = Math.max(0.5, Math.min(2.0, avgSpeed / normalSpeed));
 
-                // 更新目标位置
-                const latest = recentHistory[recentHistory.length - 1];
-                targetPlaybackPosition = latest.x;
-
-                // 开始自动播放辅助
-                startAutoPlayAssist();
+                    // 更新目标位置（只使用X坐标）
+                    const latest = recentHistory[recentHistory.length - 1];
+                    const spectPos = screenToSpectrogramCoords(latest.x, fingerPosition.y);
+                    if (spectPos) {
+                        targetPlaybackPosition = spectPos.x;
+                        startAutoPlayAssist();
+                    }
+                } else {
+                    // 向左移动或静止时停止辅助播放
+                    stopAutoPlayAssist();
+                }
             }
         }
 
@@ -926,21 +944,35 @@
 
                 if (!leftFrame || !rightFrame) return;
 
-                // 插值混合增强数据
+                // 插值混合4通道增强数据
                 const interpolatedFrame = {
                     magnitudes: new Float32Array(leftFrame.magnitudes.length),
-                    phaseHints: new Float32Array(leftFrame.phaseHints.length),
-                    harmonicHints: new Float32Array(leftFrame.harmonicHints.length)
+                    phases: new Float32Array(leftFrame.phases ? leftFrame.phases.length : leftFrame.magnitudes.length),
+                    freqDerivs: new Float32Array(leftFrame.freqDerivs ? leftFrame.freqDerivs.length : leftFrame.magnitudes.length),
+                    envelopes: new Float32Array(leftFrame.envelopes ? leftFrame.envelopes.length : leftFrame.magnitudes.length)
                 };
 
                 for (let i = 0; i < leftFrame.magnitudes.length; i++) {
                     interpolatedFrame.magnitudes[i] = leftFrame.magnitudes[i] * (1 - fraction) + rightFrame.magnitudes[i] * fraction;
-                    interpolatedFrame.phaseHints[i] = leftFrame.phaseHints[i] * (1 - fraction) + rightFrame.phaseHints[i] * fraction;
-                    interpolatedFrame.harmonicHints[i] = leftFrame.harmonicHints[i] * (1 - fraction) + rightFrame.harmonicHints[i] * fraction;
+
+                    // 处理相位信息（如果存在）
+                    if (leftFrame.phases && rightFrame.phases) {
+                        interpolatedFrame.phases[i] = leftFrame.phases[i] * (1 - fraction) + rightFrame.phases[i] * fraction;
+                    }
+
+                    // 处理频率导数（如果存在）
+                    if (leftFrame.freqDerivs && rightFrame.freqDerivs) {
+                        interpolatedFrame.freqDerivs[i] = leftFrame.freqDerivs[i] * (1 - fraction) + rightFrame.freqDerivs[i] * fraction;
+                    }
+
+                    // 处理包络信息（如果存在）
+                    if (leftFrame.envelopes && rightFrame.envelopes) {
+                        interpolatedFrame.envelopes[i] = leftFrame.envelopes[i] * (1 - fraction) + rightFrame.envelopes[i] * fraction;
+                    }
                 }
 
-                // 生成音频
-                const audioBuffer = synthesizeAudioEnhanced(interpolatedFrame);
+                // 使用IFFT方法生成音频
+                const audioBuffer = synthesizeAudioFallback(interpolatedFrame);
                 if (audioBuffer) {
                     playAudioBuffer(audioBuffer);
                 }
@@ -1002,85 +1034,95 @@
 
         // 备用合成方法
         function synthesizeAudioFallback(frameData) {
-            console.log('使用高分辨率合成方法');
-            const bufferLength = 2048; // 减少缓冲区，提高响应速度
+            console.log('使用IFFT音频重建方法');
+            const bufferLength = 2048;
             const buffer = audioContext.createBuffer(1, bufferLength, SAMPLE_RATE);
             const channelData = buffer.getChannelData(0);
 
             const magnitudes = frameData.magnitudes;
-            
-            // 找到最强的频率成分
-            const peaks = [];
-            for (let f = 2; f < magnitudes.length - 2; f++) {
+            const phases = frameData.phases || new Float32Array(magnitudes.length);
+
+            // 使用逆FFT重建音频信号
+            const fftSize = 1024;
+            const realPart = new Float32Array(fftSize);
+            const imagPart = new Float32Array(fftSize);
+
+            // 构建复数频谱
+            for (let f = 0; f < Math.min(fftSize / 2, magnitudes.length); f++) {
                 const magnitude = magnitudes[f];
-                if (magnitude > 0.05 && 
-                    magnitude > magnitudes[f-1] && 
-                    magnitude > magnitudes[f+1] &&
-                    magnitude > magnitudes[f-2] && 
-                    magnitude > magnitudes[f+2]) {
-                    
-                    const frequency = (f / magnitudes.length) * (SAMPLE_RATE / 2);
-                    if (frequency > 80 && frequency < 4000) {
-                        peaks.push({ frequency, amplitude: magnitude });
-                    }
+                const phase = phases[f];
+
+                // 转换为复数形式
+                realPart[f] = magnitude * Math.cos(phase);
+                imagPart[f] = magnitude * Math.sin(phase);
+
+                // 镜像对称（实信号的要求）
+                if (f > 0 && f < fftSize / 2) {
+                    realPart[fftSize - f] = realPart[f];
+                    imagPart[fftSize - f] = -imagPart[f];
                 }
             }
-            
-            // 按幅度排序，取前10个最强峰值
-            peaks.sort((a, b) => b.amplitude - a.amplitude);
-            const topPeaks = peaks.slice(0, 10);
-            
-            // 高质量合成
+
+            // 执行IFFT重建时域信号
+            const timeSignal = performIFFT(realPart, imagPart, fftSize);
+
+            // 将重建的信号复制到输出缓冲区
             for (let i = 0; i < bufferLength; i++) {
                 const t = i / SAMPLE_RATE;
                 let sample = 0;
 
-                // 基于峰值合成
-                for (const peak of topPeaks) {
-                    const frequency = peak.frequency;
-                    const amplitude = peak.amplitude;
-                    
-                    // 基础音调
-                    let tone = Math.sin(2 * Math.PI * frequency * t);
-                    
-                    // 添加轻微的频率调制（颤音）
-                    const vibrato = 1 + 0.02 * Math.sin(2 * Math.PI * 6 * t);
-                    tone = Math.sin(2 * Math.PI * frequency * vibrato * t);
-                    
-                    // 添加谐波丰富度
-                    if (frequency * 2 < SAMPLE_RATE / 2) {
-                        tone += 0.25 * Math.sin(2 * Math.PI * frequency * 2 * t);
-                    }
-                    if (frequency * 3 < SAMPLE_RATE / 2) {
-                        tone += 0.1 * Math.sin(2 * Math.PI * frequency * 3 * t);
-                    }
-                    
-                    sample += amplitude * tone * 0.6;
+                // 从IFFT结果中采样
+                if (i < timeSignal.length) {
+                    sample = timeSignal[i];
+                } else {
+                    // 循环播放或衰减
+                    const loopIndex = i % timeSignal.length;
+                    const decay = Math.exp(-(i - timeSignal.length) / (SAMPLE_RATE * 0.1));
+                    sample = timeSignal[loopIndex] * decay;
                 }
 
-                // 添加适量噪声纹理
-                const noiseLevel = calculateNoiseLevel(magnitudes);
-                if (noiseLevel > 0.02) {
-                    const noise = (Math.random() - 0.5) * 2;
-                    const filteredNoise = noise - (noise * 0.75); // 高通滤波
-                    sample += filteredNoise * noiseLevel * 0.1;
-                }
+                // 添加轻微的自然纹理
+                const textureNoise = (Math.random() - 0.5) * 0.02;
+                sample += textureNoise;
 
-                // 改进的包络：快速攻击，自然衰减
+                // 自然包络
                 let envelope = 1.0;
-                if (t < 0.005) {
-                    envelope = t / 0.005; // 5ms攻击
+                if (t < 0.002) {
+                    envelope = t / 0.002; // 2ms攻击
                 } else if (t > bufferLength / SAMPLE_RATE * 0.7) {
                     const fadeStart = bufferLength / SAMPLE_RATE * 0.7;
                     const fadeLength = bufferLength / SAMPLE_RATE * 0.3;
-                    envelope = Math.exp(-(t - fadeStart) / (fadeLength * 0.5));
+                    envelope = Math.exp(-(t - fadeStart) / (fadeLength * 0.4));
                 }
-                
+
                 sample *= envelope;
-                channelData[i] = Math.tanh(sample * 0.9) * 0.8;
+                channelData[i] = Math.tanh(sample * 1.2) * 0.6;
             }
 
             return buffer;
+        }
+
+        // 简化的IFFT实现
+        function performIFFT(realPart, imagPart, size) {
+            const result = new Float32Array(size);
+
+            for (let n = 0; n < size; n++) {
+                let realSum = 0;
+                let imagSum = 0;
+
+                for (let k = 0; k < size; k++) {
+                    const angle = 2 * Math.PI * k * n / size;
+                    const cosAngle = Math.cos(angle);
+                    const sinAngle = Math.sin(angle);
+
+                    realSum += realPart[k] * cosAngle - imagPart[k] * sinAngle;
+                    imagSum += realPart[k] * sinAngle + imagPart[k] * cosAngle;
+                }
+
+                result[n] = realSum / size; // 只取实部
+            }
+
+            return result;
         }
 
         // 找到主要频率成分
